@@ -245,10 +245,11 @@ inline ModeResults RunIsolatedMode(
             const double total_overshoot = total_w - target_us;
             const double spin_unacc = (spin_w >= spin_c) ? (spin_w - spin_c) : 0.0;
 
-            if (total_w < target_us) {
+            const std::uint64_t target_nanos = sleep_micros * 1000ULL;
+            if (s.t4 < s.t0 + target_nanos) {
                 res.early_returns++;
             }
-            if (total_w >= (target_us * 1.10)) {
+            if (s.t4 >= s.t0 + (target_nanos * 110ULL / 100ULL)) {
                 res.outliers_count++;
             }
 

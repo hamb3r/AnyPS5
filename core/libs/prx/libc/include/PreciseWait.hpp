@@ -230,7 +230,7 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
     }
 #ifdef APS5_PRECISE_WAIT_TRACE
     if (g_preciseWaitTraceActive) {
-        g_preciseWaitTraceSample.t0 = PreciseMonotonicNanos();
+        g_preciseWaitTraceSample.t0 = startNanos;
         g_preciseWaitTraceSample.cpu0 = PreciseThreadCpuNanosInternal();
         g_preciseWaitTraceSample.eintr_count = 0;
         g_preciseWaitTraceSample.syscall_return_code = 0;
