@@ -28,7 +28,50 @@ struct PreciseMachDeadlineResult {
     std::uint64_t wakeDeadline{0};
 };
 
-inline constexpr PreciseMachDeadlineResult PreciseComputeMachDeadline(
+inline constexpr std::uint64_t PreciseMulDivCeil64(std::uint64_t r, std::uint64_t num, std::uint64_t den) {
+    if (r == 0 || num == 0 || den == 0) {
+        return 0ULL;
+    }
+    if (r <= UINT64_MAX / num) {
+        const std::uint64_t prod = r * num;
+        return (prod / den) + ((prod % den != 0) ? 1ULL : 0ULL);
+    }
+#if defined(__SIZEOF_INT128__) && !defined(_WIN32)
+    const unsigned __int128 prod = static_cast<unsigned __int128>(r) * num;
+    const unsigned __int128 q = prod / den;
+    const unsigned __int128 rem = prod % den;
+    const unsigned __int128 res = q + (rem != 0 ? 1 : 0);
+    return res > UINT64_MAX ? UINT64_MAX : static_cast<std::uint64_t>(res);
+#else
+    std::uint64_t q = 0;
+    std::uint64_t rem = 0;
+    const std::uint64_t addQ = num / den;
+    const std::uint64_t addR = num % den;
+    for (int i = 63; i >= 0; --i) {
+        if ((r >> i) & 1ULL) {
+            q += addQ;
+            if (den - rem <= addR) {
+                q += 1;
+                rem = addR - (den - rem);
+            } else {
+                rem += addR;
+            }
+        }
+        if (i > 0) {
+            q <<= 1;
+            if (rem >= den - rem) {
+                q += 1;
+                rem = rem - (den - rem);
+            } else {
+                rem <<= 1;
+            }
+        }
+    }
+    return q + (rem != 0 ? 1ULL : 0ULL);
+#endif
+}
+
+inline constexpr PreciseMachDeadlineResult PreciseComputeMachDeadline64(
     std::uint64_t sleepNanos,
     std::uint32_t numer,
     std::uint32_t denom,
@@ -38,15 +81,6 @@ inline constexpr PreciseMachDeadlineResult PreciseComputeMachDeadline(
         result.status = 0xFFFFFFFF;
         return result;
     }
-#if defined(__SIZEOF_INT128__)
-    const unsigned __int128 sleepTicks128 =
-        (static_cast<unsigned __int128>(sleepNanos) * denom) / numer;
-    if (sleepTicks128 > UINT64_MAX) [[unlikely]] {
-        result.status = 0xFFFFFFFE;
-        return result;
-    }
-    result.sleepTicks = static_cast<std::uint64_t>(sleepTicks128);
-#else
     const std::uint64_t q = sleepNanos / numer;
     const std::uint64_t r = sleepNanos % numer;
     if (denom > 0 && q > UINT64_MAX / denom) [[unlikely]] {
@@ -60,7 +94,6 @@ inline constexpr PreciseMachDeadlineResult PreciseComputeMachDeadline(
         return result;
     }
     result.sleepTicks = baseTicks + remTicks;
-#endif
     if (result.sleepTicks > UINT64_MAX - nowTicks) [[unlikely]] {
         result.status = 0xFFFFFFFD;
         return result;
@@ -69,30 +102,66 @@ inline constexpr PreciseMachDeadlineResult PreciseComputeMachDeadline(
     return result;
 }
 
+inline constexpr PreciseMachDeadlineResult PreciseComputeMachDeadline(
+    std::uint64_t sleepNanos,
+    std::uint32_t numer,
+    std::uint32_t denom,
+    std::uint64_t nowTicks) {
+#if defined(__SIZEOF_INT128__) && !defined(_WIN32)
+    PreciseMachDeadlineResult result{};
+    if (numer == 0 || denom == 0) [[unlikely]] {
+        result.status = 0xFFFFFFFF;
+        return result;
+    }
+    const unsigned __int128 sleepTicks128 =
+        (static_cast<unsigned __int128>(sleepNanos) * denom) / numer;
+    if (sleepTicks128 > UINT64_MAX) [[unlikely]] {
+        result.status = 0xFFFFFFFE;
+        return result;
+    }
+    result.sleepTicks = static_cast<std::uint64_t>(sleepTicks128);
+    if (result.sleepTicks > UINT64_MAX - nowTicks) [[unlikely]] {
+        result.status = 0xFFFFFFFD;
+        return result;
+    }
+    result.wakeDeadline = nowTicks + result.sleepTicks;
+    return result;
+#else
+    return PreciseComputeMachDeadline64(sleepNanos, numer, denom, nowTicks);
+#endif
+}
+
 template <class Rep, class Period>
 constexpr std::uint64_t PreciseSafeDurationToNanos(const std::chrono::duration<Rep, Period>& d) {
-    if (d.count() <= 0) {
-        return 0ULL;
-    }
-    using NanoRatio = std::ratio_divide<Period, std::nano>;
-    constexpr std::uintmax_t num = static_cast<std::uintmax_t>(NanoRatio::num);
-    constexpr std::uintmax_t den = static_cast<std::uintmax_t>(NanoRatio::den);
     if constexpr (std::is_floating_point_v<Rep>) {
-        if constexpr (num == den) {
-            if (d.count() >= static_cast<Rep>(UINT64_MAX)) {
-                return UINT64_MAX;
-            }
-            return static_cast<std::uint64_t>(std::ceil(d.count()));
-        } else {
-            const double scaled =
-                static_cast<double>(d.count()) * (static_cast<double>(num) / static_cast<double>(den));
-            if (scaled >= static_cast<double>(UINT64_MAX)) {
-                return UINT64_MAX;
-            }
-            return static_cast<std::uint64_t>(std::ceil(scaled));
+        const Rep c = d.count();
+        if (std::isnan(c) || !(c > static_cast<Rep>(0))) {
+            return 0ULL;
         }
+        if (std::isinf(c)) {
+            return UINT64_MAX;
+        }
+        using NanoRatio = std::ratio_divide<Period, std::nano>;
+        constexpr double num = static_cast<double>(NanoRatio::num);
+        constexpr double den = static_cast<double>(NanoRatio::den);
+        const double scaled = static_cast<double>(c) * (num / den);
+        if (std::isinf(scaled) || scaled >= static_cast<double>(UINT64_MAX)) {
+            return UINT64_MAX;
+        }
+        return static_cast<std::uint64_t>(std::ceil(scaled));
     } else {
+        if (d.count() <= static_cast<Rep>(0)) {
+            return 0ULL;
+        }
+        if constexpr (sizeof(Rep) > sizeof(std::uint64_t)) {
+            if (d.count() > static_cast<Rep>(UINT64_MAX)) {
+                return UINT64_MAX;
+            }
+        }
         const std::uint64_t count = static_cast<std::uint64_t>(d.count());
+        using NanoRatio = std::ratio_divide<Period, std::nano>;
+        constexpr std::uintmax_t num = static_cast<std::uintmax_t>(NanoRatio::num);
+        constexpr std::uintmax_t den = static_cast<std::uintmax_t>(NanoRatio::den);
         if constexpr (num == den) {
             return count;
         } else if constexpr (den == 1) {
@@ -110,7 +179,7 @@ constexpr std::uint64_t PreciseSafeDurationToNanos(const std::chrono::duration<R
             }
             const std::uint64_t base = q * static_cast<std::uint64_t>(num);
             const std::uint64_t remTicks =
-                (r == 0) ? 0ULL : ((r * static_cast<std::uint64_t>(num) + (static_cast<std::uint64_t>(den) - 1ULL)) / static_cast<std::uint64_t>(den));
+                PreciseMulDivCeil64(r, static_cast<std::uint64_t>(num), static_cast<std::uint64_t>(den));
             if (UINT64_MAX - base < remTicks) {
                 return UINT64_MAX;
             }
@@ -564,6 +633,11 @@ inline void PreciseSleepUs(unsigned long long micros) {
     PreciseSleepNanos(micros * 1000ULL);
     return;
 #else
+    constexpr unsigned long long kMaxMicros =
+        static_cast<unsigned long long>((std::chrono::microseconds::max)().count());
+    if (micros > kMaxMicros) [[unlikely]] {
+        micros = kMaxMicros;
+    }
     std::this_thread::sleep_for(std::chrono::microseconds(micros));
 #endif
 }
@@ -648,7 +722,8 @@ inline void PreciseSleepUntil(const std::chrono::time_point<TClock, TDuration>& 
     for (auto now = TClock::now(); PreciseSafeDurationToNanos(now.time_since_epoch()) < deadlineNanos; now = TClock::now()) {
         const std::uint64_t nowNanos = PreciseSafeDurationToNanos(now.time_since_epoch());
         const std::uint64_t diffNanos = deadlineNanos - nowNanos;
-        const std::uint64_t diffMicros = (diffNanos + 999ULL) / 1000ULL;
+        const std::uint64_t diffMicros =
+            (diffNanos / 1000ULL) + ((diffNanos % 1000ULL) != 0 ? 1ULL : 0ULL);
         PreciseSleepUs(diffMicros);
     }
 #endif

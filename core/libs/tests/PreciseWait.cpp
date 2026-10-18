@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <tuple>
 
 namespace {
 
@@ -93,6 +95,25 @@ int main() {
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::pico>(1000)) == 1ULL);
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::pico>(1001)) == 2ULL);
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<1, 3>>(1)) == 333333334ULL);
+    static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<1, 1000000000000000000LL>>(1000000000LL)) == 1ULL);
+
+    static_assert(PreciseMulDivCeil64(0, 100, 10) == 0ULL);
+    static_assert(PreciseMulDivCeil64(10, 100, 10) == 100ULL);
+    static_assert(PreciseMulDivCeil64(1, 1, 3) == 1ULL);
+    static_assert(PreciseMulDivCeil64(5, 1000, 2000) == 3ULL);
+
+    static_assert(PreciseComputeMachDeadline64(1000, 0, 1, 0).status == 0xFFFFFFFF);
+    static_assert(PreciseComputeMachDeadline64(1000, 1, 0, 0).status == 0xFFFFFFFF);
+    static_assert(PreciseComputeMachDeadline64(1500000ULL, 125, 3, 1000000ULL).status == 0);
+    static_assert(PreciseComputeMachDeadline64(1500000ULL, 125, 3, 1000000ULL).sleepTicks == 36000ULL);
+    static_assert(PreciseComputeMachDeadline64(1500000ULL, 125, 3, 1000000ULL).wakeDeadline == 1036000ULL);
+    static_assert(PreciseComputeMachDeadline64(50000ULL, 1, 1, 200000ULL).status == 0);
+    static_assert(PreciseComputeMachDeadline64(50000ULL, 1, 1, 200000ULL).sleepTicks == 50000ULL);
+    static_assert(PreciseComputeMachDeadline64(50000ULL, 1, 1, 200000ULL).wakeDeadline == 250000ULL);
+    static_assert(PreciseComputeMachDeadline64(UINT64_MAX, 1, 2, 0).status == 0xFFFFFFFE);
+    static_assert(PreciseComputeMachDeadline64(1000ULL, 1, 1, UINT64_MAX - 500ULL).status == 0xFFFFFFFD);
+    static_assert(PreciseComputeMachDeadline64(1000ULL, 1, 1, UINT64_MAX - 1000ULL).status == 0);
+    static_assert(PreciseComputeMachDeadline64(1000ULL, 1, 1, UINT64_MAX - 1000ULL).wakeDeadline == UINT64_MAX);
 
     static_assert(PreciseComputeMachDeadline(1000, 0, 1, 0).status == 0xFFFFFFFF);
     static_assert(PreciseComputeMachDeadline(1000, 1, 0, 0).status == 0xFFFFFFFF);
@@ -107,26 +128,56 @@ int main() {
     static_assert(PreciseComputeMachDeadline(1000ULL, 1, 1, UINT64_MAX - 1000ULL).status == 0);
     static_assert(PreciseComputeMachDeadline(1000ULL, 1, 1, UINT64_MAX - 1000ULL).wakeDeadline == UINT64_MAX);
 
-    if (PreciseComputeMachDeadline(1000, 0, 1, 0).status != 0xFFFFFFFF) {
-        std::cerr << "PreciseComputeMachDeadline zero numer check failed\n";
+    const double nanVal = std::numeric_limits<double>::quiet_NaN();
+    if (PreciseSafeDurationToNanos(std::chrono::duration<double>(nanVal)) != 0ULL) {
+        std::cerr << "PreciseSafeDurationToNanos NaN check failed\n";
         return 1;
     }
-    if (PreciseComputeMachDeadline(1000, 1, 0, 0).status != 0xFFFFFFFF) {
-        std::cerr << "PreciseComputeMachDeadline zero denom check failed\n";
+    const double infVal = std::numeric_limits<double>::infinity();
+    if (PreciseSafeDurationToNanos(std::chrono::duration<double>(infVal)) != UINT64_MAX) {
+        std::cerr << "PreciseSafeDurationToNanos +inf check failed\n";
         return 1;
     }
-    if (PreciseComputeMachDeadline(UINT64_MAX, 1, 2, 0).status != 0xFFFFFFFE) {
-        std::cerr << "PreciseComputeMachDeadline narrowing overflow check failed\n";
+    if (PreciseSafeDurationToNanos(std::chrono::duration<double>(-infVal)) != 0ULL) {
+        std::cerr << "PreciseSafeDurationToNanos -inf check failed\n";
         return 1;
     }
-    if (PreciseComputeMachDeadline(1000ULL, 1, 1, UINT64_MAX - 500ULL).status != 0xFFFFFFFD) {
-        std::cerr << "PreciseComputeMachDeadline addition overflow check failed\n";
+    if (PreciseSafeDurationToNanos(std::chrono::duration<double>(-100.5)) != 0ULL) {
+        std::cerr << "PreciseSafeDurationToNanos negative float check failed\n";
         return 1;
     }
-    const auto exactMach = PreciseComputeMachDeadline(1000ULL, 1, 1, UINT64_MAX - 1000ULL);
-    if (exactMach.status != 0 || exactMach.wakeDeadline != UINT64_MAX) {
-        std::cerr << "PreciseComputeMachDeadline exact boundary addition failed\n";
+    if (PreciseSafeDurationToNanos(std::chrono::duration<double, std::milli>(1.5)) != 1500000ULL) {
+        std::cerr << "PreciseSafeDurationToNanos float milli check failed\n";
         return 1;
+    }
+
+#if defined(__SIZEOF_INT128__)
+    using Int128Nanos = std::chrono::duration<__int128, std::nano>;
+    const __int128 huge128 = (static_cast<__int128>(1) << 65);
+    if (PreciseSafeDurationToNanos(Int128Nanos(huge128)) != UINT64_MAX) {
+        std::cerr << "PreciseSafeDurationToNanos wide Rep overflow check failed\n";
+        return 1;
+    }
+    if (PreciseSafeDurationToNanos(Int128Nanos(500)) != 500ULL) {
+        std::cerr << "PreciseSafeDurationToNanos wide Rep normal check failed\n";
+        return 1;
+    }
+#endif
+
+    for (const auto& [sleepNanos, numer, denom, nowTicks] : {
+             std::tuple{1000ULL, 0U, 1U, 0ULL},
+             std::tuple{1000ULL, 1U, 0U, 0ULL},
+             std::tuple{1500000ULL, 125U, 3U, 1000000ULL},
+             std::tuple{50000ULL, 1U, 1U, 200000ULL},
+             std::tuple{UINT64_MAX, 1U, 2U, 0ULL},
+             std::tuple{1000ULL, 1U, 1U, UINT64_MAX - 500ULL},
+             std::tuple{1000ULL, 1U, 1U, UINT64_MAX - 1000ULL}}) {
+        const auto r1 = PreciseComputeMachDeadline(sleepNanos, numer, denom, nowTicks);
+        const auto r2 = PreciseComputeMachDeadline64(sleepNanos, numer, denom, nowTicks);
+        if (r1.status != r2.status || r1.sleepTicks != r2.sleepTicks || r1.wakeDeadline != r2.wakeDeadline) {
+            std::cerr << "PreciseComputeMachDeadline vs PreciseComputeMachDeadline64 mismatch\n";
+            return 1;
+        }
     }
 
     for (const std::uint64_t freq : {3579545ULL, 10000000ULL, 14318180ULL, 19200000ULL, 24000000ULL}) {
