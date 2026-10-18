@@ -99,6 +99,8 @@ struct ModeConfig {
     PreciseWaitBackend backend;
     bool enable_policy;
     std::string backend_name;
+    PreciseWaitSpinLoop spin_loop = PreciseWaitSpinLoop::MonotonicNanos;
+    uint32_t policy_computation_us = 500;
 };
 
 struct ModeAccumulator {
@@ -298,10 +300,11 @@ inline void RunModeSlice(
 #if defined(__APPLE__)
         if (acc.config.enable_policy) {
             mach_timebase_info_data_t tb;
-            if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer > 0) {
+            if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer > 0 && tb.denom > 0) {
                 thread_time_constraint_policy_data_t policy;
                 const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
-                const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
+                const uint64_t compUs = acc.config.policy_computation_us > 0 ? acc.config.policy_computation_us : 500;
+                const uint64_t computationTicks = (compUs * 1000ULL * tb.denom) / tb.numer;
                 if (periodTicks <= UINT32_MAX && computationTicks <= UINT32_MAX) {
                     policy.period = static_cast<uint32_t>(periodTicks);
                     policy.computation = static_cast<uint32_t>(computationTicks);
@@ -340,6 +343,8 @@ inline void RunModeSlice(
 
         g_preciseWaitTraceBackend = acc.config.backend;
         g_preciseWaitTraceAllowLowSlack = acc.config.enable_policy;
+        g_preciseWaitTraceSpinLoop = acc.config.spin_loop;
+        g_preciseWaitTracePolicyComputationUs = acc.config.policy_computation_us;
         g_preciseWaitTraceActive = true;
 
         for (int i = 0; i < warmup_count; ++i) {
@@ -907,6 +912,146 @@ int main() {
         if (cm.early_returns > 0) {
             std::cerr << "FATAL: Clock source " << cm.clock_name << " returned BEFORE deadline for "
                       << cm.target_micros << " us!\n";
+            return 1;
+        }
+    }
+
+    report << "#### 7. Spin Loop Strategy Comparison: `clock_gettime` vs `mach_absolute_time` (Policy ON, 200 µs tail, PreciseSleepUs(1500))\n\n";
+    report << "| Backend | Spin Strategy | Wall p50 | Wall p90 | Wall p99 | Wall Max | Overshoot p50 | Total CPU p50 | Spin CPU p50 | Spin Wall p50 | Outliers (>1650µs) | Early |\n";
+    report << "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n";
+
+    std::vector<ModeAccumulator> spin_strategy_modes;
+    spin_strategy_modes.push_back(ModeAccumulator{ModeConfig{PreciseWaitBackend::Nanosleep, true, "nanosleep", PreciseWaitSpinLoop::MonotonicNanos, 500}});
+    spin_strategy_modes.push_back(ModeAccumulator{ModeConfig{PreciseWaitBackend::Nanosleep, true, "nanosleep", PreciseWaitSpinLoop::MachTicks, 500}});
+    spin_strategy_modes.push_back(ModeAccumulator{ModeConfig{PreciseWaitBackend::MachWaitUntil, true, "mach_wait_until", PreciseWaitSpinLoop::MonotonicNanos, 500}});
+    spin_strategy_modes.push_back(ModeAccumulator{ModeConfig{PreciseWaitBackend::MachWaitUntil, true, "mach_wait_until", PreciseWaitSpinLoop::MachTicks, 500}});
+
+    const size_t num_spin_modes = spin_strategy_modes.size();
+    const int kSpinStrategyRounds = 5;
+    const int kSpinStrategyWarmup = 5;
+    const int kSpinStrategySamples = 40;
+
+    const std::vector<std::vector<int>> spin_permutations = {
+        {0, 1, 2, 3},
+        {3, 2, 1, 0},
+        {1, 3, 0, 2},
+        {2, 0, 3, 1},
+        {0, 2, 1, 3}
+    };
+
+    for (int r = 0; r < kSpinStrategyRounds; ++r) {
+        const auto& perm = spin_permutations[r % spin_permutations.size()];
+        for (int idx : perm) {
+            if (static_cast<size_t>(idx) < num_spin_modes) {
+                RunModeSlice(spin_strategy_modes[idx], 1500, kSpinStrategyWarmup, kSpinStrategySamples,
+                    calibration.total_wall.p50,
+                    calibration.total_cpu.p50,
+                    calibration.spin_cpu.p50);
+            }
+        }
+    }
+
+    for (auto& sm : spin_strategy_modes) {
+        FinalizeStats(sm);
+        const std::string strat_name = (sm.config.spin_loop == PreciseWaitSpinLoop::MachTicks)
+            ? "`mach_absolute_time` ticks"
+            : "`clock_gettime` nanos";
+        report << "| `" << sm.config.backend_name << "` | " << strat_name << " | "
+               << std::fixed << std::setprecision(1)
+               << sm.s_total_wall.p50 << " µs | "
+               << sm.s_total_wall.p90 << " µs | "
+               << sm.s_total_wall.p99 << " µs | "
+               << sm.s_total_wall.max_val << " µs | +"
+               << sm.s_total_overshoot.p50 << " µs | "
+               << sm.s_total_cpu.p50 << " µs | "
+               << sm.s_spin_cpu.p50 << " µs | "
+               << sm.s_spin_wall.p50 << " µs | "
+               << sm.outliers_count << " / " << sm.total_samples << " | "
+               << sm.early_returns << " |\n";
+    }
+    report << "\n";
+
+    for (const auto& sm : spin_strategy_modes) {
+        if (sm.early_returns > 0) {
+            std::cerr << "FATAL: Spin strategy mode " << sm.config.backend_name << " returned BEFORE deadline!\n";
+            return 1;
+        }
+        if (sm.syscall_errors > 0) {
+            std::cerr << "FATAL: Spin strategy mode " << sm.config.backend_name << " encountered syscall errors!\n";
+            return 1;
+        }
+        if (sm.policy_failures > 0) {
+            std::cerr << "FATAL: Spin strategy mode " << sm.config.backend_name << " encountered policy failures!\n";
+            return 1;
+        }
+    }
+
+    report << "#### 8. Policy Computation Budget Sweep: 250 µs vs 350 µs vs 500 µs (Fixed 200 µs Spin Tail, PreciseSleepUs(1500))\n\n";
+    report << "| Backend | Budget | Wall p50 | Wall p90 | Wall p99 | Wall Max | Overshoot p50 | Total CPU p50 | Syscall Wall p50 | Syscall Overshoot p50 | Outliers (>1650µs) | Early |\n";
+    report << "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n";
+
+    std::vector<ModeAccumulator> budget_modes;
+    for (const uint32_t comp_us : {250U, 350U, 500U}) {
+        budget_modes.push_back(ModeAccumulator{ModeConfig{PreciseWaitBackend::Nanosleep, true, "nanosleep", PreciseWaitSpinLoop::MonotonicNanos, comp_us}});
+    }
+    for (const uint32_t comp_us : {250U, 350U, 500U}) {
+        budget_modes.push_back(ModeAccumulator{ModeConfig{PreciseWaitBackend::MachWaitUntil, true, "mach_wait_until", PreciseWaitSpinLoop::MonotonicNanos, comp_us}});
+    }
+
+    const size_t num_budget_modes = budget_modes.size();
+    const int kBudgetRounds = 5;
+    const int kBudgetWarmup = 5;
+    const int kBudgetSamples = 40;
+
+    const std::vector<std::vector<int>> budget_permutations = {
+        {0, 1, 2, 3, 4, 5},
+        {5, 4, 3, 2, 1, 0},
+        {1, 3, 5, 0, 2, 4},
+        {4, 2, 0, 5, 3, 1},
+        {2, 0, 4, 1, 5, 3}
+    };
+
+    for (int r = 0; r < kBudgetRounds; ++r) {
+        const auto& perm = budget_permutations[r % budget_permutations.size()];
+        for (int idx : perm) {
+            if (static_cast<size_t>(idx) < num_budget_modes) {
+                RunModeSlice(budget_modes[idx], 1500, kBudgetWarmup, kBudgetSamples,
+                    calibration.total_wall.p50,
+                    calibration.total_cpu.p50,
+                    calibration.spin_cpu.p50);
+            }
+        }
+    }
+
+    for (auto& bm : budget_modes) {
+        FinalizeStats(bm);
+        report << "| `" << bm.config.backend_name << "` | "
+               << bm.config.policy_computation_us << " µs | "
+               << std::fixed << std::setprecision(1)
+               << bm.s_total_wall.p50 << " µs | "
+               << bm.s_total_wall.p90 << " µs | "
+               << bm.s_total_wall.p99 << " µs | "
+               << bm.s_total_wall.max_val << " µs | +"
+               << bm.s_total_overshoot.p50 << " µs | "
+               << bm.s_total_cpu.p50 << " µs | "
+               << bm.s_sleep_wall.p50 << " µs | +"
+               << bm.s_sleep_overshoot.p50 << " µs | "
+               << bm.outliers_count << " / " << bm.total_samples << " | "
+               << bm.early_returns << " |\n";
+    }
+    report << "\n";
+
+    for (const auto& bm : budget_modes) {
+        if (bm.early_returns > 0) {
+            std::cerr << "FATAL: Budget mode " << bm.config.backend_name << " returned BEFORE deadline!\n";
+            return 1;
+        }
+        if (bm.syscall_errors > 0) {
+            std::cerr << "FATAL: Budget mode " << bm.config.backend_name << " encountered syscall errors!\n";
+            return 1;
+        }
+        if (bm.policy_failures > 0) {
+            std::cerr << "FATAL: Budget mode " << bm.config.backend_name << " encountered policy failures!\n";
             return 1;
         }
     }

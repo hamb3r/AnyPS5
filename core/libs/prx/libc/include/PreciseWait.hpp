@@ -388,54 +388,15 @@ inline std::uint64_t PreciseMonotonicNanos() {
     return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(ts.tv_nsec);
 }
 
-#ifdef __linux__
-inline bool PreciseLinuxLowTimerSlack() {
-    static thread_local const bool lowSlack = [] {
-        const long current = prctl(PR_GET_TIMERSLACK, 0UL, 0UL, 0UL, 0UL);
-        return current == 1L || prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL) == 0;
-    }();
-    return lowSlack;
-}
-#elif defined(__APPLE__)
-#include <mach/mach_init.h>
-#include <mach/mach_port.h>
-#include <mach/mach_time.h>
-#include <mach/thread_act.h>
-#include <mach/thread_policy.h>
-
-inline bool PreciseAppleLowTimerSlack() {
-    static thread_local const bool lowSlack = [] {
-        mach_timebase_info_data_t tb;
-        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0) {
-            return false;
-        }
-        thread_time_constraint_policy_data_t policy;
-        const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
-        const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
-        if (periodTicks > UINT32_MAX || computationTicks > UINT32_MAX) {
-            return false;
-        }
-        policy.period = static_cast<uint32_t>(periodTicks);
-        policy.computation = static_cast<uint32_t>(computationTicks);
-        policy.constraint = static_cast<uint32_t>(periodTicks);
-        policy.preemptible = TRUE;
-        const mach_port_t threadPort = mach_thread_self();
-        const kern_return_t kr = thread_policy_set(
-            threadPort,
-            THREAD_TIME_CONSTRAINT_POLICY,
-            reinterpret_cast<thread_policy_t>(&policy),
-            THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-        mach_port_deallocate(mach_task_self(), threadPort);
-        return kr == KERN_SUCCESS;
-    }();
-    return lowSlack;
-}
-#endif
-
 #ifdef APS5_PRECISE_WAIT_TRACE
 enum class PreciseWaitBackend {
     Nanosleep,
     MachWaitUntil
+};
+
+enum class PreciseWaitSpinLoop {
+    MonotonicNanos,
+    MachTicks
 };
 
 struct PreciseWaitTraceSample {
@@ -458,7 +419,9 @@ struct PreciseWaitTraceSample {
 inline thread_local PreciseWaitTraceSample g_preciseWaitTraceSample{};
 inline thread_local bool g_preciseWaitTraceActive = false;
 inline thread_local PreciseWaitBackend g_preciseWaitTraceBackend = PreciseWaitBackend::Nanosleep;
+inline thread_local PreciseWaitSpinLoop g_preciseWaitTraceSpinLoop = PreciseWaitSpinLoop::MonotonicNanos;
 inline thread_local bool g_preciseWaitTraceAllowLowSlack = true;
+inline thread_local std::uint32_t g_preciseWaitTracePolicyComputationUs = 500;
 
 inline std::uint64_t PreciseThreadCpuNanosInternal() {
 #if defined(CLOCK_THREAD_CPUTIME_ID)
@@ -468,6 +431,55 @@ inline std::uint64_t PreciseThreadCpuNanosInternal() {
     }
 #endif
     return 0;
+}
+#endif
+
+#ifdef __linux__
+inline bool PreciseLinuxLowTimerSlack() {
+    static thread_local const bool lowSlack = [] {
+        const long current = prctl(PR_GET_TIMERSLACK, 0UL, 0UL, 0UL, 0UL);
+        return current == 1L || prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL) == 0;
+    }();
+    return lowSlack;
+}
+#elif defined(__APPLE__)
+#include <mach/mach_init.h>
+#include <mach/mach_port.h>
+#include <mach/mach_time.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
+
+inline bool PreciseAppleLowTimerSlack() {
+    static thread_local const bool lowSlack = [] {
+        mach_timebase_info_data_t tb;
+        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0 || tb.denom == 0) {
+            return false;
+        }
+        thread_time_constraint_policy_data_t policy;
+        const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
+#ifdef APS5_PRECISE_WAIT_TRACE
+        const uint64_t compUs = g_preciseWaitTracePolicyComputationUs > 0 ? g_preciseWaitTracePolicyComputationUs : 500;
+        const uint64_t computationTicks = (compUs * 1000ULL * tb.denom) / tb.numer;
+#else
+        const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
+#endif
+        if (periodTicks > UINT32_MAX || computationTicks > UINT32_MAX) {
+            return false;
+        }
+        policy.period = static_cast<uint32_t>(periodTicks);
+        policy.computation = static_cast<uint32_t>(computationTicks);
+        policy.constraint = static_cast<uint32_t>(periodTicks);
+        policy.preemptible = TRUE;
+        const mach_port_t threadPort = mach_thread_self();
+        const kern_return_t kr = thread_policy_set(
+            threadPort,
+            THREAD_TIME_CONSTRAINT_POLICY,
+            reinterpret_cast<thread_policy_t>(&policy),
+            THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+        mach_port_deallocate(mach_task_self(), threadPort);
+        return kr == KERN_SUCCESS;
+    }();
+    return lowSlack;
 }
 #endif
 
@@ -662,6 +674,34 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
         }
     }
 #endif
+#if defined(__APPLE__) && defined(APS5_PRECISE_WAIT_TRACE)
+    if (g_preciseWaitTraceActive && g_preciseWaitTraceSpinLoop == PreciseWaitSpinLoop::MachTicks) {
+        mach_timebase_info_data_t tb;
+        if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer > 0 && tb.denom > 0) {
+            const std::uint64_t nowNanos = PreciseMonotonicNanos();
+            if (nowNanos < deadlineNanos) {
+                const std::uint64_t remainingNanos = deadlineNanos - nowNanos;
+                const std::uint64_t nowTicks = mach_absolute_time();
+                const auto spinDeadline =
+                    PreciseComputeMachDeadline(remainingNanos, tb.numer, tb.denom, nowTicks);
+                if (spinDeadline.status == 0) {
+                    const std::uint64_t pauseThresholdTicks =
+                        (200ULL * tb.denom + tb.numer - 1ULL) / tb.numer;
+                    const std::uint64_t wakeTicks = spinDeadline.wakeDeadline;
+                    for (;;) {
+                        const std::uint64_t curTicks = mach_absolute_time();
+                        if (curTicks >= wakeTicks) {
+                            break;
+                        }
+                        if (wakeTicks - curTicks > pauseThresholdTicks) {
+                            PreciseSpinPause();
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+#endif
     for (;;) {
         const std::uint64_t nowNanos = PreciseMonotonicNanos();
         if (nowNanos >= deadlineNanos) {
@@ -671,6 +711,9 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
             PreciseSpinPause();
         }
     }
+#if defined(__APPLE__) && defined(APS5_PRECISE_WAIT_TRACE)
+    }
+#endif
 #ifdef APS5_PRECISE_WAIT_TRACE
     if (g_preciseWaitTraceActive) {
         g_preciseWaitTraceSample.t3 = PreciseMonotonicNanos();
