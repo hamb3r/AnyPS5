@@ -453,6 +453,163 @@ inline void FinalizeStats(ModeAccumulator& m) {
     m.s_cal_total_cpu = ComputeStats(m.v_cal_total_cpu);
 }
 
+#if !defined(__APPLE__)
+struct mach_timebase_info_data_t {
+    uint32_t numer{1};
+    uint32_t denom{1};
+};
+#endif
+
+struct ClockProbeStats {
+    double min_ns;
+    double p50_ns;
+    double p90_ns;
+    double p99_ns;
+    double mean_ns;
+    double max_ns;
+};
+
+inline ClockProbeStats MeasureClockProbe(int type, int chunks = 1000, int per_chunk = 100) {
+    std::vector<double> v;
+    v.reserve(chunks);
+    for (int c = 0; c < chunks; ++c) {
+        const auto t0 = Clock::now();
+        for (int i = 0; i < per_chunk; ++i) {
+            if (type == 0) {
+                struct timespec ts{};
+#if defined(CLOCK_MONOTONIC_RAW)
+                clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#endif
+                DoNotOptimize(ts.tv_nsec);
+            } else if (type == 1) {
+#if defined(__APPLE__)
+                const uint64_t ticks = mach_absolute_time();
+                DoNotOptimize(ticks);
+#endif
+            } else if (type == 2) {
+#if defined(__APPLE__) && defined(CLOCK_MONOTONIC_RAW)
+                const uint64_t ns = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                DoNotOptimize(ns);
+#endif
+            }
+        }
+        const auto t1 = Clock::now();
+        const double elapsed_ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
+        v.push_back(elapsed_ns / static_cast<double>(per_chunk));
+    }
+    const auto s = ComputeStats(v);
+    return ClockProbeStats{s.min_val, s.p50, s.p90, s.p99, s.mean, s.max_val};
+}
+
+struct ClockSpinAccumulator {
+    int clock_type;
+    std::string clock_name;
+    uint64_t target_micros;
+    uint64_t total_samples = 0;
+    uint64_t early_returns = 0;
+
+    std::vector<double> v_wall;
+    std::vector<double> v_cpu;
+    std::vector<double> v_overshoot;
+    std::vector<double> v_unaccounted;
+
+    PercentileStats s_wall;
+    PercentileStats s_cpu;
+    PercentileStats s_overshoot;
+    PercentileStats s_unaccounted;
+};
+
+inline void RunClockSpinSlice(
+    ClockSpinAccumulator& acc,
+    int warmup_count,
+    int sample_count,
+    mach_timebase_info_data_t tb) {
+    std::thread worker([&] {
+#if defined(__APPLE__)
+        if (tb.numer > 0) {
+            thread_time_constraint_policy_data_t policy;
+            const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
+            const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
+            if (periodTicks <= UINT32_MAX && computationTicks <= UINT32_MAX) {
+                policy.period = static_cast<uint32_t>(periodTicks);
+                policy.computation = static_cast<uint32_t>(computationTicks);
+                policy.constraint = static_cast<uint32_t>(periodTicks);
+                policy.preemptible = TRUE;
+                const mach_port_t threadPort = mach_thread_self();
+                thread_policy_set(
+                    threadPort,
+                    THREAD_TIME_CONSTRAINT_POLICY,
+                    reinterpret_cast<thread_policy_t>(&policy),
+                    THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+                mach_port_deallocate(mach_task_self(), threadPort);
+            }
+        }
+#endif
+        const uint64_t target_nanos = acc.target_micros * 1000ULL;
+        const double target_us = static_cast<double>(acc.target_micros);
+        const uint64_t mach_delta_ticks = (acc.clock_type == 1 && tb.numer > 0)
+            ? (target_nanos * tb.denom + tb.numer - 1ULL) / tb.numer
+            : 0ULL;
+
+        auto do_spin = [&]() {
+            if (acc.clock_type == 0) {
+                const uint64_t deadline = PreciseMonotonicNanos() + target_nanos;
+                while (PreciseMonotonicNanos() < deadline) {
+                    PreciseSpinPause();
+                }
+            } else if (acc.clock_type == 1) {
+#if defined(__APPLE__)
+                const uint64_t deadlineTicks = mach_absolute_time() + mach_delta_ticks;
+                while (mach_absolute_time() < deadlineTicks) {
+                    PreciseSpinPause();
+                }
+#endif
+            } else if (acc.clock_type == 2) {
+#if defined(__APPLE__) && defined(CLOCK_MONOTONIC_RAW)
+                const uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) + target_nanos;
+                while (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < deadline) {
+                    PreciseSpinPause();
+                }
+#endif
+            }
+        };
+
+        for (int i = 0; i < warmup_count; ++i) {
+            do_spin();
+        }
+
+        for (int i = 0; i < sample_count; ++i) {
+            const uint64_t t0 = PreciseMonotonicNanos();
+            const uint64_t c0 = ReadThreadCpuNanos();
+            do_spin();
+            const uint64_t t1 = PreciseMonotonicNanos();
+            const uint64_t c1 = ReadThreadCpuNanos();
+
+            acc.total_samples++;
+            if (t1 < t0 + target_nanos) {
+                acc.early_returns++;
+            }
+            const double wall_us = static_cast<double>(t1 - t0) / 1000.0;
+            const double cpu_us = (c1 >= c0) ? static_cast<double>(c1 - c0) / 1000.0 : 0.0;
+            const double overshoot_us = wall_us - target_us;
+            const double unacc_us = (wall_us >= cpu_us) ? (wall_us - cpu_us) : 0.0;
+
+            acc.v_wall.push_back(wall_us);
+            acc.v_cpu.push_back(cpu_us);
+            acc.v_overshoot.push_back(overshoot_us);
+            acc.v_unaccounted.push_back(unacc_us);
+        }
+    });
+    worker.join();
+}
+
+inline void FinalizeClockStats(ClockSpinAccumulator& acc) {
+    acc.s_wall = ComputeStats(acc.v_wall);
+    acc.s_cpu = ComputeStats(acc.v_cpu);
+    acc.s_overshoot = ComputeStats(acc.v_overshoot);
+    acc.s_unaccounted = ComputeStats(acc.v_unaccounted);
+}
+
 int main() {
     std::ostringstream report;
 
@@ -673,6 +830,87 @@ int main() {
                << m.s_total_cpu.p99 << " µs | " << m.s_total_cpu.mean << " µs | "
                << m.s_total_cpu.max_val << " µs |\n\n";
     }
+
+#if defined(__APPLE__)
+    report << "#### 6. Clock Source Comparison (Probe Latency & Spin Loop)\n\n";
+
+    report << "##### 6.1 Single Read Probe Latency (100k samples, 1000 chunks x 100 reads)\n\n";
+    report << "| Clock Source | Min Latency | p50 Latency | p90 Latency | p99 Latency | Mean Latency | Max Latency |\n";
+    report << "|---|---:|---:|---:|---:|---:|---:|\n";
+
+    const auto p_gettime = MeasureClockProbe(0);
+    const auto p_mach = MeasureClockProbe(1);
+    const auto p_np = MeasureClockProbe(2);
+
+    report << "| `clock_gettime(CLOCK_MONOTONIC_RAW)` | "
+           << std::fixed << std::setprecision(1)
+           << p_gettime.min_ns << " ns | " << p_gettime.p50_ns << " ns | "
+           << p_gettime.p90_ns << " ns | " << p_gettime.p99_ns << " ns | "
+           << p_gettime.mean_ns << " ns | " << p_gettime.max_ns << " ns |\n";
+    report << "| `mach_absolute_time()` | "
+           << p_mach.min_ns << " ns | " << p_mach.p50_ns << " ns | "
+           << p_mach.p90_ns << " ns | " << p_mach.p99_ns << " ns | "
+           << p_mach.mean_ns << " ns | " << p_mach.max_ns << " ns |\n";
+    report << "| `clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)` | "
+           << p_np.min_ns << " ns | " << p_np.p50_ns << " ns | "
+           << p_np.p90_ns << " ns | " << p_np.p99_ns << " ns | "
+           << p_np.mean_ns << " ns | " << p_np.max_ns << " ns |\n\n";
+
+    report << "##### 6.2 Spin Loop Comparison (Policy ON, Fresh Threads, Interleaved Rounds)\n\n";
+    report << "| Target Duration | Clock Source | Wall p50 | Wall p90 | Wall p99 | Overshoot p50 | CPU Time p50 | Spin Unaccounted p50 | Early Returns |\n";
+    report << "|---|---|---:|---:|---:|---:|---:|---:|---:|\n";
+
+    std::vector<ClockSpinAccumulator> clock_modes;
+    for (const uint64_t target_us : {50ULL, 1000ULL, 1500ULL}) {
+        clock_modes.push_back(ClockSpinAccumulator{0, "clock_gettime", target_us});
+        clock_modes.push_back(ClockSpinAccumulator{1, "mach_absolute_time", target_us});
+        clock_modes.push_back(ClockSpinAccumulator{2, "clock_gettime_nsec_np", target_us});
+    }
+
+    const size_t num_clock_modes = clock_modes.size();
+    const int kClockRounds = 5;
+    const int kClockWarmup = 5;
+    const int kClockSamples = 20;
+
+    const std::vector<std::vector<int>> clock_permutations = {
+        {0, 1, 2, 3, 4, 5, 6, 7, 8},
+        {8, 7, 6, 5, 4, 3, 2, 1, 0},
+        {2, 5, 8, 1, 4, 7, 0, 3, 6},
+        {6, 3, 0, 7, 4, 1, 8, 5, 2},
+        {4, 0, 8, 2, 6, 1, 7, 3, 5}
+    };
+
+    for (int r = 0; r < kClockRounds; ++r) {
+        const auto& perm = clock_permutations[r % clock_permutations.size()];
+        for (int idx : perm) {
+            if (static_cast<size_t>(idx) < num_clock_modes) {
+                RunClockSpinSlice(clock_modes[idx], kClockWarmup, kClockSamples, tb);
+            }
+        }
+    }
+
+    for (auto& cm : clock_modes) {
+        FinalizeClockStats(cm);
+        report << "| " << cm.target_micros << " µs | `" << cm.clock_name << "` | "
+               << std::fixed << std::setprecision(1)
+               << cm.s_wall.p50 << " µs | "
+               << cm.s_wall.p90 << " µs | "
+               << cm.s_wall.p99 << " µs | +"
+               << cm.s_overshoot.p50 << " µs | "
+               << cm.s_cpu.p50 << " µs | "
+               << cm.s_unaccounted.p50 << " µs | "
+               << cm.early_returns << " |\n";
+    }
+    report << "\n";
+
+    for (const auto& cm : clock_modes) {
+        if (cm.early_returns > 0) {
+            std::cerr << "FATAL: Clock source " << cm.clock_name << " returned BEFORE deadline for "
+                      << cm.target_micros << " us!\n";
+            return 1;
+        }
+    }
+#endif
 
     std::cout << report.str();
 
