@@ -449,49 +449,61 @@ inline bool PreciseLinuxLowTimerSlack() {
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
 
-inline const mach_timebase_info_data_t& PreciseMachTimebase() {
-    static const mach_timebase_info_data_t tb = [] {
-        mach_timebase_info_data_t t{0, 0};
-        if (mach_timebase_info(&t) != KERN_SUCCESS) {
-            t.numer = 0;
-            t.denom = 0;
-        }
+inline mach_timebase_info_data_t PreciseMachTimebase() {
+    static std::atomic<std::uint64_t> cached{0};
+    const std::uint64_t val = cached.load(std::memory_order_relaxed);
+    if (val != 0) [[likely]] {
+        mach_timebase_info_data_t tb;
+        tb.numer = static_cast<std::uint32_t>(val);
+        tb.denom = static_cast<std::uint32_t>(val >> 32);
+        return tb;
+    }
+    mach_timebase_info_data_t t{0, 0};
+    if (mach_timebase_info(&t) == KERN_SUCCESS && t.numer > 0 && t.denom > 0) [[likely]] {
+        const std::uint64_t packed =
+            static_cast<std::uint64_t>(t.numer) | (static_cast<std::uint64_t>(t.denom) << 32);
+        cached.store(packed, std::memory_order_relaxed);
         return t;
-    }();
-    return tb;
+    }
+    return {0, 0};
 }
 
 inline bool PreciseAppleLowTimerSlack() {
-    static thread_local const bool lowSlack = [] {
-        const auto& tb = PreciseMachTimebase();
-        if (tb.numer == 0 || tb.denom == 0) {
-            return false;
-        }
-        thread_time_constraint_policy_data_t policy;
-        const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
+    static thread_local bool lowSlack = false;
+    if (lowSlack) [[likely]] {
+        return true;
+    }
+    const auto tb = PreciseMachTimebase();
+    if (tb.numer == 0 || tb.denom == 0) {
+        return false;
+    }
+    thread_time_constraint_policy_data_t policy;
+    const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
 #ifdef APS5_PRECISE_WAIT_TRACE
-        const uint64_t compUs = g_preciseWaitTracePolicyComputationUs > 0 ? g_preciseWaitTracePolicyComputationUs : 500;
-        const uint64_t computationTicks = (compUs * 1000ULL * tb.denom) / tb.numer;
+    const uint64_t compUs = g_preciseWaitTracePolicyComputationUs > 0 ? g_preciseWaitTracePolicyComputationUs : 500;
+    const uint64_t computationTicks = (compUs * 1000ULL * tb.denom) / tb.numer;
 #else
-        const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
+    const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
 #endif
-        if (periodTicks > UINT32_MAX || computationTicks > UINT32_MAX) {
-            return false;
-        }
-        policy.period = static_cast<uint32_t>(periodTicks);
-        policy.computation = static_cast<uint32_t>(computationTicks);
-        policy.constraint = static_cast<uint32_t>(periodTicks);
-        policy.preemptible = TRUE;
-        const mach_port_t threadPort = mach_thread_self();
-        const kern_return_t kr = thread_policy_set(
-            threadPort,
-            THREAD_TIME_CONSTRAINT_POLICY,
-            reinterpret_cast<thread_policy_t>(&policy),
-            THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-        mach_port_deallocate(mach_task_self(), threadPort);
-        return kr == KERN_SUCCESS;
-    }();
-    return lowSlack;
+    if (periodTicks > UINT32_MAX || computationTicks > UINT32_MAX) {
+        return false;
+    }
+    policy.period = static_cast<uint32_t>(periodTicks);
+    policy.computation = static_cast<uint32_t>(computationTicks);
+    policy.constraint = static_cast<uint32_t>(periodTicks);
+    policy.preemptible = TRUE;
+    const mach_port_t threadPort = mach_thread_self();
+    const kern_return_t kr = thread_policy_set(
+        threadPort,
+        THREAD_TIME_CONSTRAINT_POLICY,
+        reinterpret_cast<thread_policy_t>(&policy),
+        THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    mach_port_deallocate(mach_task_self(), threadPort);
+    if (kr == KERN_SUCCESS) {
+        lowSlack = true;
+        return true;
+    }
+    return false;
 }
 #endif
 
