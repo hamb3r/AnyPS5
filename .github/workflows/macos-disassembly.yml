@@ -114,8 +114,8 @@ jobs:
 
           if [ -f "tools/bench_macos_timer.cpp" ]; then
             echo "=== Compiling Production bench_macos ==="
-            clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -o "$PROD_DIR/bench_macos"
-            clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -S -o "$PROD_DIR/bench_macos.s"
+            clang++ -std=c++20 -O3 -DNDEBUG -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -o "$PROD_DIR/bench_macos"
+            clang++ -std=c++20 -O3 -DNDEBUG -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -S -o "$PROD_DIR/bench_macos.s"
 
             echo "=== Disassembling Production bench_macos ==="
             xcrun llvm-objdump --macho --disassemble --demangle --arch "$ARCH" "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.${ARCH}.asm.txt"
@@ -139,8 +139,8 @@ jobs:
 
           if [ -f "tools/bench_macos_timer.cpp" ]; then
             echo "=== Compiling Diagnostic bench_macos (-g) ==="
-            clang++ -std=c++20 -O3 -DNDEBUG -g -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -o "$DIAG_DIR/bench_macos_diag"
-            clang++ -std=c++20 -O3 -DNDEBUG -g -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -S -o "$DIAG_DIR/bench_macos_diag.s"
+            clang++ -std=c++20 -O3 -DNDEBUG -g -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -o "$DIAG_DIR/bench_macos_diag"
+            clang++ -std=c++20 -O3 -DNDEBUG -g -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -S -o "$DIAG_DIR/bench_macos_diag.s"
 
             echo "=== Disassembling Diagnostic bench_macos with Source Correlation ==="
             xcrun llvm-objdump --macho --disassemble --demangle --source --arch "$ARCH" "$DIAG_DIR/bench_macos_diag" > "$DIAG_DIR/bench_macos_diag.${ARCH}.source_asm.txt"
