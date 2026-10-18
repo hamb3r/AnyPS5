@@ -32,3 +32,31 @@ jobs:
           echo "=== Running PreciseWait Unit Tests (APS5_SKIP_TIMING_TESTS=1) ==="
           APS5_SKIP_TIMING_TESTS=1 ./precise_wait_tests
           echo "Unit tests passed with 0 early returns."
+
+  windows-test:
+    name: windows-latest
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile and Run PreciseWait Unit Tests (clang-cl)
+        shell: cmd
+        run: |
+          echo "=== Compiling with clang-cl ==="
+          clang-cl /EHsc /std:c++20 /O2 /DNDEBUG /Icore/libs core/libs/tests/PreciseWait.cpp /Feprecise_wait_clangcl.exe
+          set APS5_SKIP_TIMING_TESTS=1
+          precise_wait_clangcl.exe
+          echo "clang-cl tests passed."
+
+      - name: Compile and Run PreciseWait Unit Tests (MSVC cl)
+        shell: cmd
+        run: |
+          echo "=== Compiling with MSVC cl ==="
+          cl /EHsc /std:c++20 /O2 /DNDEBUG /Icore/libs core/libs/tests/PreciseWait.cpp /Feprecise_wait_msvc.exe
+          set APS5_SKIP_TIMING_TESTS=1
+          precise_wait_msvc.exe
+          echo "MSVC cl tests passed."

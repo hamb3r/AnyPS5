@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <ratio>
 #include <thread>
 #include <type_traits>
@@ -199,12 +200,11 @@ constexpr std::uint64_t PreciseSafeDurationToNanos(const std::chrono::duration<R
         if (c != c || !(c > static_cast<Rep>(0))) {
             return 0ULL;
         }
-        if (c > std::numeric_limits<Rep>::max() || PreciseSafeNanoRatio<Period>::overflows_tick) {
+        if (c > std::numeric_limits<Rep>::max()) {
             return UINT64_MAX;
         }
-        constexpr double num = static_cast<double>(PreciseSafeNanoRatio<Period>::num);
-        constexpr double den = static_cast<double>(PreciseSafeNanoRatio<Period>::den);
-        const double scaled = static_cast<double>(c) * (num / den);
+        constexpr double kScale = (static_cast<double>(Period::num) / static_cast<double>(Period::den)) * 1000000000.0;
+        const double scaled = static_cast<double>(c) * kScale;
         if (scaled > std::numeric_limits<double>::max() || scaled >= static_cast<double>(UINT64_MAX)) {
             return UINT64_MAX;
         }
