@@ -126,6 +126,8 @@ inline void PreciseSleepHundredNanos(unsigned long long hundredNanos) {
 inline void PreciseSpinPause() {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     _mm_pause();
+#elif defined(__aarch64__) || defined(__arm64__)
+    asm volatile("yield" ::: "memory");
 #else
     std::atomic_signal_fence(std::memory_order_seq_cst);
 #endif
@@ -151,6 +153,7 @@ inline bool PreciseLinuxLowTimerSlack() {
 }
 #elif defined(__APPLE__)
 #include <mach/mach_init.h>
+#include <mach/mach_port.h>
 #include <mach/mach_time.h>
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
@@ -163,15 +166,19 @@ inline bool PreciseAppleLowTimerSlack() {
         }
         thread_time_constraint_policy_data_t policy;
         const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
-        policy.period = static_cast<uint32_t>(periodTicks);
-        policy.computation = static_cast<uint32_t>((500000ULL * tb.denom) / tb.numer);
-        policy.constraint = static_cast<uint32_t>(periodTicks);
+        const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
+        policy.period = static_cast<uint32_t>(std::min<uint64_t>(periodTicks, UINT32_MAX));
+        policy.computation = static_cast<uint32_t>(std::min<uint64_t>(computationTicks, UINT32_MAX));
+        policy.constraint = static_cast<uint32_t>(std::min<uint64_t>(periodTicks, UINT32_MAX));
         policy.preemptible = TRUE;
-        return thread_policy_set(
-            mach_thread_self(),
+        const mach_port_t threadPort = mach_thread_self();
+        const kern_return_t kr = thread_policy_set(
+            threadPort,
             THREAD_TIME_CONSTRAINT_POLICY,
             reinterpret_cast<thread_policy_t>(&policy),
-            THREAD_TIME_CONSTRAINT_POLICY_COUNT) == KERN_SUCCESS;
+            THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+        mach_port_deallocate(mach_task_self(), threadPort);
+        return kr == KERN_SUCCESS;
     }();
     return lowSlack;
 }
@@ -195,7 +202,7 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
     }
 #elif defined(__APPLE__)
     const bool lowSlack = allowLowSlack && PreciseAppleLowTimerSlack();
-    const unsigned long long spinTailNanos = lowSlack ? 50000ULL : 500000ULL;
+    const unsigned long long spinTailNanos = lowSlack ? 200000ULL : 500000ULL;
     if (nanos > spinTailNanos) [[unlikely]] {
         const unsigned long long sleepNanos = nanos - spinTailNanos;
         struct timespec req;
