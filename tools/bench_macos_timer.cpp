@@ -88,7 +88,8 @@ int main() {
            << ")\n";
     report << "- **CLOCK_MONOTONIC resolution:** " << res_mono.tv_nsec << " ns\n";
     report << "- **CLOCK_MONOTONIC_RAW resolution:** " << res_raw.tv_nsec << " ns\n";
-    report << "- **CLOCK_MONOTONIC vs RAW offset:** " << std::fixed << std::setprecision(2) << offset_ms << " ms\n\n";
+    report << "- **CLOCK_MONOTONIC vs RAW offset:** " << std::fixed << std::setprecision(2) << offset_ms << " ms\n";
+    report << "- **PreciseAppleLowTimerSlack active:** " << (PreciseAppleLowTimerSlack() ? "YES (THREAD_TIME_CONSTRAINT_POLICY)" : "NO") << "\n\n";
 #else
     report << "- **Platform:** Non-Apple POSIX\n\n";
 #endif

@@ -149,6 +149,32 @@ inline bool PreciseLinuxLowTimerSlack() {
     }();
     return lowSlack;
 }
+#elif defined(__APPLE__)
+#include <mach/mach_init.h>
+#include <mach/mach_time.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
+
+inline bool PreciseAppleLowTimerSlack() {
+    static thread_local const bool lowSlack = [] {
+        mach_timebase_info_data_t tb;
+        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0) {
+            return false;
+        }
+        thread_time_constraint_policy_data_t policy;
+        const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
+        policy.period = static_cast<uint32_t>(periodTicks);
+        policy.computation = static_cast<uint32_t>((500000ULL * tb.denom) / tb.numer);
+        policy.constraint = static_cast<uint32_t>(periodTicks);
+        policy.preemptible = TRUE;
+        return thread_policy_set(
+            mach_thread_self(),
+            THREAD_TIME_CONSTRAINT_POLICY,
+            reinterpret_cast<thread_policy_t>(&policy),
+            THREAD_TIME_CONSTRAINT_POLICY_COUNT) == KERN_SUCCESS;
+    }();
+    return lowSlack;
+}
 #endif
 
 inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned long long nanos, bool allowLowSlack) {
@@ -165,6 +191,17 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
         req.tv_sec = static_cast<time_t>(wakeNanos / 1000000000ULL);
         req.tv_nsec = static_cast<long>(wakeNanos % 1000000000ULL);
         while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &req, nullptr) == EINTR) {
+        }
+    }
+#elif defined(__APPLE__)
+    const bool lowSlack = allowLowSlack && PreciseAppleLowTimerSlack();
+    const unsigned long long spinTailNanos = lowSlack ? 50000ULL : 500000ULL;
+    if (nanos > spinTailNanos) [[unlikely]] {
+        const unsigned long long sleepNanos = nanos - spinTailNanos;
+        struct timespec req;
+        req.tv_sec = static_cast<time_t>(sleepNanos / 1000000000ULL);
+        req.tv_nsec = static_cast<long>(sleepNanos % 1000000000ULL);
+        while (nanosleep(&req, &req) == -1 && errno == EINTR) {
         }
     }
 #else
