@@ -44,6 +44,8 @@ jobs:
           void export_PreciseSleepNanos(unsigned long long nanos) {
           #if !defined(_WIN32)
               PreciseSleepNanos(nanos);
+          #else
+              (void)nanos;
           #endif
           }
           void export_PreciseSleepUntil_steady(std::int64_t nanos) {
@@ -56,17 +58,59 @@ jobs:
               return false;
           #endif
           }
-          std::uint64_t export_PreciseSafeDurationToNanos_double(double d) {
-              return PreciseSafeDurationToNanos(std::chrono::duration<double>(d));
-          }
           std::uint64_t export_PreciseSafeDurationToNanos_int64(std::int64_t d) {
               return PreciseSafeDurationToNanos(std::chrono::nanoseconds(d));
           }
+          std::uint64_t export_PreciseSafeDurationToNanos_double(double d) {
+              return PreciseSafeDurationToNanos(std::chrono::duration<double>(d));
+          }
+          std::uint64_t export_PreciseSafeDurationToNanos_double_kilo(double d) {
+              return PreciseSafeDurationToNanos(std::chrono::duration<double, std::kilo>(d));
+          }
+          std::uint64_t export_PreciseSafeDurationToNanos_double_nano(double d) {
+              return PreciseSafeDurationToNanos(std::chrono::duration<double, std::nano>(d));
+          }
+          #if defined(__SIZEOF_INT128__)
+          std::uint64_t export_PreciseSafeDurationToNanos_int128(unsigned __int128 d) {
+              return PreciseSafeDurationToNanos(std::chrono::duration<unsigned __int128, std::milli>(d));
+          }
+          #endif
+          std::uint64_t export_PreciseSafeDurationToNanos_custom_ratio(std::int64_t d) {
+              return PreciseSafeDurationToNanos(std::chrono::duration<std::int64_t, std::ratio<1, 1000000000000000000LL>>(d));
+          }
+          std::uint64_t export_PreciseMulDivCeilFallback64(std::uint64_t r, std::uint64_t num, std::uint64_t den) {
+              return PreciseMulDivCeilFallback64(r, num, den);
+          }
+          }
+
           #if defined(__APPLE__)
-          auto export_PreciseComputeMachDeadline(std::uint64_t nanos, std::uint32_t numer, std::uint32_t denom, std::uint64_t now) {
+          mach_timebase_info_data_t export_PreciseMachTimebase() {
+              return PreciseMachTimebase();
+          }
+          PreciseMachDeadlineResult export_PreciseComputeMachDeadline(std::uint64_t nanos, std::uint32_t numer, std::uint32_t denom, std::uint64_t now) {
               return PreciseComputeMachDeadline(nanos, numer, denom, now);
           }
           #endif
+          PreciseMachDeadlineResult export_PreciseComputeMachDeadline64(std::uint64_t nanos, std::uint32_t numer, std::uint32_t denom, std::uint64_t now) {
+              return PreciseComputeMachDeadline64(nanos, numer, denom, now);
+          }
+          EOF
+
+          cat << 'EOF' > tools/bench_production.cpp
+          #include "prx/libc/include/PreciseWait.hpp"
+          #include <iostream>
+          #include <chrono>
+
+          int main() {
+              std::cout << "=== Running Production PreciseWait Benchmark (No Trace) ===\n";
+              const auto t0 = std::chrono::steady_clock::now();
+              for (int i = 0; i < 1000; ++i) {
+                  PreciseSleepUs(1500);
+              }
+              const auto t1 = std::chrono::steady_clock::now();
+              const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+              std::cout << "1000 x PreciseSleepUs(1500): " << ms << " ms total\n";
+              return 0;
           }
           EOF
 
@@ -96,14 +140,14 @@ jobs:
           echo "Production Compiler Flags:" >> "$META_FILE"
           echo "clang++ -std=c++20 -O3 -DNDEBUG -arch ${{ matrix.arch }} -Icore/libs" >> "$META_FILE"
           echo "Diagnostic Compiler Flags:" >> "$META_FILE"
-          echo "clang++ -std=c++20 -O3 -DNDEBUG -g -arch ${{ matrix.arch }} -Icore/libs" >> "$META_FILE"
+          echo "clang++ -std=c++20 -O3 -DNDEBUG -g -DAPS5_PRECISE_WAIT_TRACE=1 -arch ${{ matrix.arch }} -Icore/libs" >> "$META_FILE"
 
-      - name: Build and Disassemble Production Variant (-O3 -DNDEBUG)
+      - name: Build and Disassemble Production Variant (-O3 -DNDEBUG, No Trace)
         run: |
           ARCH="${{ matrix.arch }}"
           PROD_DIR="output/production"
 
-          echo "=== Compiling Production PreciseWait ==="
+          echo "=== Compiling Pure Production PreciseWait ==="
           clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -c -o "$PROD_DIR/precise_wait.o"
           clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -S -o "$PROD_DIR/precise_wait.s"
 
@@ -112,18 +156,16 @@ jobs:
           xcrun otool -tvV -arch "$ARCH" "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.${ARCH}.otool.txt"
           nm -nm "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.symbols.txt"
 
-          if [ -f "tools/bench_macos_timer.cpp" ]; then
-            echo "=== Compiling Production bench_macos ==="
-            clang++ -std=c++20 -O3 -DNDEBUG -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -o "$PROD_DIR/bench_macos"
-            clang++ -std=c++20 -O3 -DNDEBUG -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -S -o "$PROD_DIR/bench_macos.s"
+          echo "=== Compiling Pure Production bench_macos ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/bench_production.cpp -o "$PROD_DIR/bench_macos"
+          clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/bench_production.cpp -S -o "$PROD_DIR/bench_macos.s"
 
-            echo "=== Disassembling Production bench_macos ==="
-            xcrun llvm-objdump --macho --disassemble --demangle --arch "$ARCH" "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.${ARCH}.asm.txt"
-            xcrun otool -tvV -arch "$ARCH" "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.${ARCH}.otool.txt"
-            nm -nm "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.symbols.txt"
-          fi
+          echo "=== Disassembling Production bench_macos ==="
+          xcrun llvm-objdump --macho --disassemble --demangle --arch "$ARCH" "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.${ARCH}.asm.txt"
+          xcrun otool -tvV -arch "$ARCH" "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.${ARCH}.otool.txt"
+          nm -nm "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.symbols.txt"
 
-      - name: Build and Disassemble Diagnostic Variant (-O3 -DNDEBUG -g)
+      - name: Build and Disassemble Diagnostic Variant (-O3 -DNDEBUG -g, With Trace)
         run: |
           ARCH="${{ matrix.arch }}"
           DIAG_DIR="output/diagnostic"
@@ -138,7 +180,7 @@ jobs:
           nm -nm "$DIAG_DIR/precise_wait_diag.o" > "$DIAG_DIR/precise_wait_diag.symbols.txt"
 
           if [ -f "tools/bench_macos_timer.cpp" ]; then
-            echo "=== Compiling Diagnostic bench_macos (-g) ==="
+            echo "=== Compiling Diagnostic bench_macos_diag (-g, APS5_PRECISE_WAIT_TRACE=1) ==="
             clang++ -std=c++20 -O3 -DNDEBUG -g -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -o "$DIAG_DIR/bench_macos_diag"
             clang++ -std=c++20 -O3 -DNDEBUG -g -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -S -o "$DIAG_DIR/bench_macos_diag.s"
 
@@ -147,6 +189,52 @@ jobs:
             xcrun otool -tvV -arch "$ARCH" "$DIAG_DIR/bench_macos_diag" > "$DIAG_DIR/bench_macos_diag.${ARCH}.otool.txt"
             nm -nm "$DIAG_DIR/bench_macos_diag" > "$DIAG_DIR/bench_macos_diag.symbols.txt"
           fi
+
+      - name: Verify Production Artifacts for Trace Symbols and Runtime Helpers
+        run: |
+          ARCH="${{ matrix.arch }}"
+          REPORT_FILE="output/verification_report.txt"
+          echo "=== Production Artifacts Verification Report ($ARCH) ===" > "$REPORT_FILE"
+          echo "Commit SHA: $(git rev-parse HEAD)" >> "$REPORT_FILE"
+          echo "Date: $(date -u)" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+
+          echo "--- 1. Check for Trace Symbols in Production Objects ---" >> "$REPORT_FILE"
+          TRACE_SYMS_O=$(nm -nm output/production/precise_wait.o | grep -i "trace" || true)
+          if [ -n "$TRACE_SYMS_O" ]; then
+            echo "FAIL: Unexpected trace symbols in production/precise_wait.o:" >> "$REPORT_FILE"
+            echo "$TRACE_SYMS_O" >> "$REPORT_FILE"
+            exit 1
+          else
+            echo "PASS: 0 trace symbols found in production/precise_wait.o." >> "$REPORT_FILE"
+          fi
+
+          TRACE_SYMS_BIN=$(nm -nm output/production/bench_macos | grep -i "g_preciseWaitTrace" || true)
+          if [ -n "$TRACE_SYMS_BIN" ]; then
+            echo "FAIL: Unexpected trace symbols in production/bench_macos:" >> "$REPORT_FILE"
+            echo "$TRACE_SYMS_BIN" >> "$REPORT_FILE"
+            exit 1
+          else
+            echo "PASS: 0 trace symbols found in production/bench_macos." >> "$REPORT_FILE"
+          fi
+
+          echo "" >> "$REPORT_FILE"
+          echo "--- 2. Runtime Helper Symbols Audit (__udivti3 / __umodti3) ---" >> "$REPORT_FILE"
+          DIV_SYMS=$(nm -nm output/production/precise_wait.o | grep -E "__udivti3|__umodti3" || true)
+          if [ -n "$DIV_SYMS" ]; then
+            echo "AUDIT: Found 128-bit division helpers in production/precise_wait.o:" >> "$REPORT_FILE"
+            echo "$DIV_SYMS" >> "$REPORT_FILE"
+            echo "Explanation: __udivti3 is called by export_PreciseComputeMachDeadline (unsigned __int128 / uint32_t)." >> "$REPORT_FILE"
+          else
+            echo "PASS: No __udivti3 / __umodti3 helpers found in production/precise_wait.o." >> "$REPORT_FILE"
+          fi
+
+          echo "" >> "$REPORT_FILE"
+          echo "--- 3. 64-bit Fallback Symbol Audit ---" >> "$REPORT_FILE"
+          FALLBACK_SYMS=$(nm -nm output/production/precise_wait.o | grep -E "PreciseMulDivCeilFallback64|export_PreciseComputeMachDeadline64" || true)
+          echo "$FALLBACK_SYMS" >> "$REPORT_FILE"
+
+          cat "$REPORT_FILE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Disassembly Artifacts
         uses: actions/upload-artifact@v7
