@@ -167,9 +167,12 @@ inline bool PreciseAppleLowTimerSlack() {
         thread_time_constraint_policy_data_t policy;
         const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
         const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
-        policy.period = static_cast<uint32_t>(std::min<uint64_t>(periodTicks, UINT32_MAX));
-        policy.computation = static_cast<uint32_t>(std::min<uint64_t>(computationTicks, UINT32_MAX));
-        policy.constraint = static_cast<uint32_t>(std::min<uint64_t>(periodTicks, UINT32_MAX));
+        if (periodTicks > UINT32_MAX || computationTicks > UINT32_MAX) {
+            return false;
+        }
+        policy.period = static_cast<uint32_t>(periodTicks);
+        policy.computation = static_cast<uint32_t>(computationTicks);
+        policy.constraint = static_cast<uint32_t>(periodTicks);
         policy.preemptible = TRUE;
         const mach_port_t threadPort = mach_thread_self();
         const kern_return_t kr = thread_policy_set(
