@@ -3,7 +3,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <ratio>
 #include <thread>
 #include <type_traits>
 
@@ -18,6 +20,103 @@ inline constexpr std::uint64_t PreciseHundredNanosToQpcTicks(unsigned long long 
 
 inline constexpr std::uint64_t PrecisePauseThresholdTicks(std::uint64_t freq) {
     return PreciseHundredNanosToQpcTicks(2ULL, freq);
+}
+
+struct PreciseMachDeadlineResult {
+    std::uint32_t status{0};
+    std::uint64_t sleepTicks{0};
+    std::uint64_t wakeDeadline{0};
+};
+
+inline constexpr PreciseMachDeadlineResult PreciseComputeMachDeadline(
+    std::uint64_t sleepNanos,
+    std::uint32_t numer,
+    std::uint32_t denom,
+    std::uint64_t nowTicks) {
+    PreciseMachDeadlineResult result{};
+    if (numer == 0 || denom == 0) [[unlikely]] {
+        result.status = 0xFFFFFFFF;
+        return result;
+    }
+#if defined(__SIZEOF_INT128__)
+    const unsigned __int128 sleepTicks128 =
+        (static_cast<unsigned __int128>(sleepNanos) * denom) / numer;
+    if (sleepTicks128 > UINT64_MAX) [[unlikely]] {
+        result.status = 0xFFFFFFFE;
+        return result;
+    }
+    result.sleepTicks = static_cast<std::uint64_t>(sleepTicks128);
+#else
+    const std::uint64_t q = sleepNanos / numer;
+    const std::uint64_t r = sleepNanos % numer;
+    if (denom > 0 && q > UINT64_MAX / denom) [[unlikely]] {
+        result.status = 0xFFFFFFFE;
+        return result;
+    }
+    const std::uint64_t baseTicks = q * denom;
+    const std::uint64_t remTicks = (r * static_cast<std::uint64_t>(denom)) / numer;
+    if (remTicks > UINT64_MAX - baseTicks) [[unlikely]] {
+        result.status = 0xFFFFFFFE;
+        return result;
+    }
+    result.sleepTicks = baseTicks + remTicks;
+#endif
+    if (result.sleepTicks > UINT64_MAX - nowTicks) [[unlikely]] {
+        result.status = 0xFFFFFFFD;
+        return result;
+    }
+    result.wakeDeadline = nowTicks + result.sleepTicks;
+    return result;
+}
+
+template <class Rep, class Period>
+constexpr std::uint64_t PreciseSafeDurationToNanos(const std::chrono::duration<Rep, Period>& d) {
+    if (d.count() <= 0) {
+        return 0ULL;
+    }
+    using NanoRatio = std::ratio_divide<Period, std::nano>;
+    constexpr std::uintmax_t num = static_cast<std::uintmax_t>(NanoRatio::num);
+    constexpr std::uintmax_t den = static_cast<std::uintmax_t>(NanoRatio::den);
+    if constexpr (std::is_floating_point_v<Rep>) {
+        if constexpr (num == den) {
+            if (d.count() >= static_cast<Rep>(UINT64_MAX)) {
+                return UINT64_MAX;
+            }
+            return static_cast<std::uint64_t>(std::ceil(d.count()));
+        } else {
+            const double scaled =
+                static_cast<double>(d.count()) * (static_cast<double>(num) / static_cast<double>(den));
+            if (scaled >= static_cast<double>(UINT64_MAX)) {
+                return UINT64_MAX;
+            }
+            return static_cast<std::uint64_t>(std::ceil(scaled));
+        }
+    } else {
+        const std::uint64_t count = static_cast<std::uint64_t>(d.count());
+        if constexpr (num == den) {
+            return count;
+        } else if constexpr (den == 1) {
+            constexpr std::uint64_t kMaxCount = UINT64_MAX / static_cast<std::uint64_t>(num);
+            if (count > kMaxCount) {
+                return UINT64_MAX;
+            }
+            return count * static_cast<std::uint64_t>(num);
+        } else {
+            const std::uint64_t q = count / static_cast<std::uint64_t>(den);
+            const std::uint64_t r = count % static_cast<std::uint64_t>(den);
+            constexpr std::uint64_t kMaxQ = UINT64_MAX / static_cast<std::uint64_t>(num);
+            if (q > kMaxQ) {
+                return UINT64_MAX;
+            }
+            const std::uint64_t base = q * static_cast<std::uint64_t>(num);
+            const std::uint64_t remTicks =
+                (r == 0) ? 0ULL : ((r * static_cast<std::uint64_t>(num) + (static_cast<std::uint64_t>(den) - 1ULL)) / static_cast<std::uint64_t>(den));
+            if (UINT64_MAX - base < remTicks) {
+                return UINT64_MAX;
+            }
+            return base + remTicks;
+        }
+    }
 }
 
 #ifdef _WIN32
@@ -310,7 +409,7 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
 #ifdef APS5_PRECISE_WAIT_TRACE
         if (g_preciseWaitTraceActive && g_preciseWaitTraceBackend == PreciseWaitBackend::MachWaitUntil) {
             mach_timebase_info_data_t tb;
-            if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0 || tb.denom == 0) [[unlikely]] {
+            if (mach_timebase_info(&tb) != KERN_SUCCESS) [[unlikely]] {
                 g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
                 g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
                 g_preciseWaitTraceSample.t2 = g_preciseWaitTraceSample.t1;
@@ -320,33 +419,23 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
                 g_preciseWaitTraceSample.syscall_return_code = 0xFFFFFFFF;
                 return;
             }
-            const unsigned __int128 sleepTicks128 =
-                (static_cast<unsigned __int128>(sleepNanos) * tb.denom) / tb.numer;
-            if (sleepTicks128 > UINT64_MAX) [[unlikely]] {
+            const std::uint64_t nowTicks = mach_absolute_time();
+            const auto machDeadline =
+                PreciseComputeMachDeadline(sleepNanos, tb.numer, tb.denom, nowTicks);
+            if (machDeadline.status != 0) [[unlikely]] {
                 g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
                 g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
                 g_preciseWaitTraceSample.t2 = g_preciseWaitTraceSample.t1;
                 g_preciseWaitTraceSample.cpu2 = g_preciseWaitTraceSample.cpu1;
                 g_preciseWaitTraceSample.t3 = g_preciseWaitTraceSample.t1;
                 g_preciseWaitTraceSample.cpu3 = g_preciseWaitTraceSample.cpu1;
-                g_preciseWaitTraceSample.syscall_return_code = 0xFFFFFFFE;
+                g_preciseWaitTraceSample.syscall_return_code = machDeadline.status;
                 return;
             }
-            const std::uint64_t sleepTicks = static_cast<std::uint64_t>(sleepTicks128);
             g_preciseWaitTraceSample.req_sleep_nanos = sleepNanos;
             g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
             g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
-            const std::uint64_t nowTicks = mach_absolute_time();
-            if (sleepTicks > UINT64_MAX - nowTicks) [[unlikely]] {
-                g_preciseWaitTraceSample.t2 = PreciseMonotonicNanos();
-                g_preciseWaitTraceSample.cpu2 = PreciseThreadCpuNanosInternal();
-                g_preciseWaitTraceSample.t3 = g_preciseWaitTraceSample.t2;
-                g_preciseWaitTraceSample.cpu3 = g_preciseWaitTraceSample.cpu2;
-                g_preciseWaitTraceSample.syscall_return_code = 0xFFFFFFFD;
-                return;
-            }
-            const std::uint64_t wakeDeadline = nowTicks + sleepTicks;
-            const kern_return_t kr = mach_wait_until(wakeDeadline);
+            const kern_return_t kr = mach_wait_until(machDeadline.wakeDeadline);
             g_preciseWaitTraceSample.t2 = PreciseMonotonicNanos();
             g_preciseWaitTraceSample.cpu2 = PreciseThreadCpuNanosInternal();
             g_preciseWaitTraceSample.syscall_return_code = static_cast<std::uint32_t>(kr);
@@ -488,14 +577,9 @@ inline void PreciseSleepUntil(const std::chrono::time_point<TClock, TDuration>& 
             if (rawDeadline <= 0) [[unlikely]] {
                 return;
             }
-            using HundredNanos = std::chrono::duration<std::int64_t, std::ratio<1, 10000000>>;
-            std::uint64_t targetHns = 0;
-            if constexpr (std::is_same_v<typename TDuration::period, std::nano>) {
-                targetHns = (static_cast<std::uint64_t>(rawDeadline) + 99ULL) / 100ULL;
-            } else {
-                targetHns = static_cast<std::uint64_t>(
-                    std::chrono::ceil<HundredNanos>(deadline.time_since_epoch()).count());
-            }
+            const std::uint64_t targetNanos = PreciseSafeDurationToNanos(deadline.time_since_epoch());
+            const std::uint64_t targetHns =
+                (targetNanos / 100ULL) + ((targetNanos % 100ULL) != 0 ? 1ULL : 0ULL);
             LARGE_INTEGER counter;
             QueryPerformanceCounter(&counter);
             const std::uint64_t nowTicks = static_cast<std::uint64_t>(counter.QuadPart);
@@ -505,17 +589,25 @@ inline void PreciseSleepUntil(const std::chrono::time_point<TClock, TDuration>& 
             return;
         }
     }
+    const std::uint64_t deadlineNanos = PreciseSafeDurationToNanos(deadline.time_since_epoch());
+    if (deadlineNanos == 0) [[unlikely]] {
+        return;
+    }
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
     const auto now = TClock::now();
-    if (now < deadline) {
-        const auto remainingNs = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
-        if (remainingNs > 0) {
-            PreciseSleepFromCounter(counter, (static_cast<unsigned long long>(remainingNs) + 99ULL) / 100ULL);
+    const std::uint64_t nowNanos = PreciseSafeDurationToNanos(now.time_since_epoch());
+    if (nowNanos < deadlineNanos) {
+        const std::uint64_t remainingNs = deadlineNanos - nowNanos;
+        const std::uint64_t remainingHns =
+            (remainingNs / 100ULL) + ((remainingNs % 100ULL) != 0 ? 1ULL : 0ULL);
+        if (remainingHns > 0) {
+            PreciseSleepFromCounter(counter, remainingHns);
         }
     }
-    for (auto current = TClock::now(); current < deadline; current = TClock::now()) {
-        if (deadline - current > std::chrono::nanoseconds(200)) {
+    for (auto current = TClock::now(); PreciseSafeDurationToNanos(current.time_since_epoch()) < deadlineNanos; current = TClock::now()) {
+        const std::uint64_t currentNanos = PreciseSafeDurationToNanos(current.time_since_epoch());
+        if (deadlineNanos - currentNanos > 200ULL) {
             YieldProcessor();
         }
     }
@@ -527,13 +619,7 @@ inline void PreciseSleepUntil(const std::chrono::time_point<TClock, TDuration>& 
         if (rawDeadline <= 0) [[unlikely]] {
             return;
         }
-        std::uint64_t targetNanos = 0;
-        if constexpr (std::is_same_v<typename TDuration::period, std::nano>) {
-            targetNanos = static_cast<std::uint64_t>(rawDeadline);
-        } else {
-            targetNanos = static_cast<std::uint64_t>(
-                std::chrono::ceil<std::chrono::nanoseconds>(deadline.time_since_epoch()).count());
-        }
+        const std::uint64_t targetNanos = PreciseSafeDurationToNanos(deadline.time_since_epoch());
         const std::uint64_t startNanos = PreciseMonotonicNanos();
         if (startNanos < targetNanos) {
             PreciseSleepFromNanos(startNanos, targetNanos - startNanos);
@@ -541,22 +627,29 @@ inline void PreciseSleepUntil(const std::chrono::time_point<TClock, TDuration>& 
         return;
     }
 #endif
+    const std::uint64_t deadlineNanos = PreciseSafeDurationToNanos(deadline.time_since_epoch());
+    if (deadlineNanos == 0) [[unlikely]] {
+        return;
+    }
     const std::uint64_t startNanos = PreciseMonotonicNanos();
     const auto now = TClock::now();
-    if (now < deadline) {
-        const auto remainingNs = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
-        if (remainingNs > 0) {
-            PreciseSleepFromNanos(startNanos, static_cast<unsigned long long>(remainingNs));
-        }
+    const std::uint64_t nowNanos = PreciseSafeDurationToNanos(now.time_since_epoch());
+    if (nowNanos < deadlineNanos) {
+        PreciseSleepFromNanos(startNanos, deadlineNanos - nowNanos);
     }
-    for (auto current = TClock::now(); current < deadline; current = TClock::now()) {
-        if (deadline - current > std::chrono::nanoseconds(200)) {
+    for (auto current = TClock::now(); PreciseSafeDurationToNanos(current.time_since_epoch()) < deadlineNanos; current = TClock::now()) {
+        const std::uint64_t currentNanos = PreciseSafeDurationToNanos(current.time_since_epoch());
+        if (deadlineNanos - currentNanos > 200ULL) {
             PreciseSpinPause();
         }
     }
 #else
-    for (auto now = TClock::now(); now < deadline; now = TClock::now()) {
-        PreciseSleepUs(static_cast<unsigned long long>(std::chrono::ceil<std::chrono::microseconds>(deadline - now).count()));
+    const std::uint64_t deadlineNanos = PreciseSafeDurationToNanos(deadline.time_since_epoch());
+    for (auto now = TClock::now(); PreciseSafeDurationToNanos(now.time_since_epoch()) < deadlineNanos; now = TClock::now()) {
+        const std::uint64_t nowNanos = PreciseSafeDurationToNanos(now.time_since_epoch());
+        const std::uint64_t diffNanos = deadlineNanos - nowNanos;
+        const std::uint64_t diffMicros = (diffNanos + 999ULL) / 1000ULL;
+        PreciseSleepUs(diffMicros);
     }
 #endif
 }
