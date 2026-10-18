@@ -187,6 +187,30 @@ inline bool PreciseAppleLowTimerSlack() {
 }
 #endif
 
+#ifdef APS5_PRECISE_WAIT_TRACE
+struct PreciseWaitTraceData {
+    std::uint64_t t1_nanos;
+    std::uint64_t t2_nanos;
+    std::uint64_t t3_nanos;
+    std::uint64_t cpu1_nanos;
+    std::uint64_t cpu2_nanos;
+    std::uint64_t cpu3_nanos;
+    std::uint64_t requested_sleep_nanos;
+};
+inline thread_local PreciseWaitTraceData g_preciseWaitTraceData{};
+inline thread_local bool g_preciseWaitTraceActive = false;
+
+inline std::uint64_t PreciseThreadCpuNanosInternal() {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+        return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+    }
+#endif
+    return 0;
+}
+#endif
+
 inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned long long nanos, bool allowLowSlack) {
     if (nanos == 0) {
         return;
@@ -195,6 +219,13 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
 #ifdef __linux__
     const bool lowSlack = allowLowSlack && PreciseLinuxLowTimerSlack();
     const unsigned long long spinTailNanos = lowSlack ? 15000ULL : 100000ULL;
+#ifdef APS5_PRECISE_WAIT_TRACE
+    if (g_preciseWaitTraceActive) {
+        g_preciseWaitTraceData.requested_sleep_nanos = (nanos > spinTailNanos) ? (nanos - spinTailNanos) : 0ULL;
+        g_preciseWaitTraceData.t1_nanos = PreciseMonotonicNanos();
+        g_preciseWaitTraceData.cpu1_nanos = PreciseThreadCpuNanosInternal();
+    }
+#endif
     if (nanos > spinTailNanos) [[unlikely]] {
         const std::uint64_t wakeNanos = deadlineNanos - spinTailNanos;
         struct timespec req;
@@ -203,9 +234,22 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
         while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &req, nullptr) == EINTR) {
         }
     }
+#ifdef APS5_PRECISE_WAIT_TRACE
+    if (g_preciseWaitTraceActive) {
+        g_preciseWaitTraceData.t2_nanos = PreciseMonotonicNanos();
+        g_preciseWaitTraceData.cpu2_nanos = PreciseThreadCpuNanosInternal();
+    }
+#endif
 #elif defined(__APPLE__)
     const bool lowSlack = allowLowSlack && PreciseAppleLowTimerSlack();
     const unsigned long long spinTailNanos = lowSlack ? 200000ULL : 500000ULL;
+#ifdef APS5_PRECISE_WAIT_TRACE
+    if (g_preciseWaitTraceActive) {
+        g_preciseWaitTraceData.requested_sleep_nanos = (nanos > spinTailNanos) ? (nanos - spinTailNanos) : 0ULL;
+        g_preciseWaitTraceData.t1_nanos = PreciseMonotonicNanos();
+        g_preciseWaitTraceData.cpu1_nanos = PreciseThreadCpuNanosInternal();
+    }
+#endif
     if (nanos > spinTailNanos) [[unlikely]] {
         const unsigned long long sleepNanos = nanos - spinTailNanos;
         struct timespec req;
@@ -214,6 +258,12 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
         while (nanosleep(&req, &req) == -1 && errno == EINTR) {
         }
     }
+#ifdef APS5_PRECISE_WAIT_TRACE
+    if (g_preciseWaitTraceActive) {
+        g_preciseWaitTraceData.t2_nanos = PreciseMonotonicNanos();
+        g_preciseWaitTraceData.cpu2_nanos = PreciseThreadCpuNanosInternal();
+    }
+#endif
 #else
     (void)allowLowSlack;
     constexpr unsigned long long kSpinTailNanos = 100000ULL;
@@ -235,6 +285,12 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
             PreciseSpinPause();
         }
     }
+#ifdef APS5_PRECISE_WAIT_TRACE
+    if (g_preciseWaitTraceActive) {
+        g_preciseWaitTraceData.t3_nanos = PreciseMonotonicNanos();
+        g_preciseWaitTraceData.cpu3_nanos = PreciseThreadCpuNanosInternal();
+    }
+#endif
 }
 
 inline void PreciseSleepFromNanos(std::uint64_t startNanos, unsigned long long nanos) {

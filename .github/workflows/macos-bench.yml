@@ -21,7 +21,7 @@ jobs:
       - name: Compile and Run Benchmark
         run: |
           echo "=== Compiling bench_macos_timer ==="
-          clang++ -std=c++20 -O3 -DNDEBUG -Icore/libs tools/bench_macos_timer.cpp -o bench_macos
+          clang++ -std=c++20 -O3 -DNDEBUG -DAPS5_PRECISE_WAIT_TRACE=1 -Icore/libs tools/bench_macos_timer.cpp -o bench_macos
           echo "=== Running bench_macos_timer ==="
           ./bench_macos
 
