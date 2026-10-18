@@ -449,10 +449,22 @@ inline bool PreciseLinuxLowTimerSlack() {
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
 
+inline const mach_timebase_info_data_t& PreciseMachTimebase() {
+    static const mach_timebase_info_data_t tb = [] {
+        mach_timebase_info_data_t t{0, 0};
+        if (mach_timebase_info(&t) != KERN_SUCCESS) {
+            t.numer = 0;
+            t.denom = 0;
+        }
+        return t;
+    }();
+    return tb;
+}
+
 inline bool PreciseAppleLowTimerSlack() {
     static thread_local const bool lowSlack = [] {
-        mach_timebase_info_data_t tb;
-        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0 || tb.denom == 0) {
+        const auto& tb = PreciseMachTimebase();
+        if (tb.numer == 0 || tb.denom == 0) {
             return false;
         }
         thread_time_constraint_policy_data_t policy;
@@ -561,13 +573,31 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
     if (g_preciseWaitTraceActive) {
         g_preciseWaitTraceSample.spin_tail_nanos = spinTailNanos;
     }
+    std::uint64_t machSpinDeadlineTicks = 0;
+    bool useMachSpinTicks = false;
+    if (g_preciseWaitTraceActive && g_preciseWaitTraceSpinLoop == PreciseWaitSpinLoop::MachTicks) {
+        const auto& tb = PreciseMachTimebase();
+        if (tb.numer > 0 && tb.denom > 0) {
+            const std::uint64_t nowNanos = PreciseMonotonicNanos();
+            if (nowNanos < deadlineNanos) {
+                const std::uint64_t remainingNanos = deadlineNanos - nowNanos;
+                const std::uint64_t nowTicks = mach_absolute_time();
+                const auto machDeadline =
+                    PreciseComputeMachDeadline(remainingNanos, tb.numer, tb.denom, nowTicks);
+                if (machDeadline.status == 0) {
+                    machSpinDeadlineTicks = machDeadline.wakeDeadline;
+                    useMachSpinTicks = true;
+                }
+            }
+        }
+    }
 #endif
     if (nanos > spinTailNanos) [[unlikely]] {
         const unsigned long long sleepNanos = nanos - spinTailNanos;
 #ifdef APS5_PRECISE_WAIT_TRACE
         if (g_preciseWaitTraceActive && g_preciseWaitTraceBackend == PreciseWaitBackend::MachWaitUntil) {
-            mach_timebase_info_data_t tb;
-            if (mach_timebase_info(&tb) != KERN_SUCCESS) [[unlikely]] {
+            const auto& tb = PreciseMachTimebase();
+            if (tb.numer == 0 || tb.denom == 0) [[unlikely]] {
                 g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
                 g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
                 g_preciseWaitTraceSample.t2 = g_preciseWaitTraceSample.t1;
@@ -675,29 +705,17 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
     }
 #endif
 #if defined(__APPLE__) && defined(APS5_PRECISE_WAIT_TRACE)
-    if (g_preciseWaitTraceActive && g_preciseWaitTraceSpinLoop == PreciseWaitSpinLoop::MachTicks) {
-        mach_timebase_info_data_t tb;
-        if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer > 0 && tb.denom > 0) {
-            const std::uint64_t nowNanos = PreciseMonotonicNanos();
-            if (nowNanos < deadlineNanos) {
-                const std::uint64_t remainingNanos = deadlineNanos - nowNanos;
-                const std::uint64_t nowTicks = mach_absolute_time();
-                const auto spinDeadline =
-                    PreciseComputeMachDeadline(remainingNanos, tb.numer, tb.denom, nowTicks);
-                if (spinDeadline.status == 0) {
-                    const std::uint64_t pauseThresholdTicks =
-                        (200ULL * tb.denom + tb.numer - 1ULL) / tb.numer;
-                    const std::uint64_t wakeTicks = spinDeadline.wakeDeadline;
-                    for (;;) {
-                        const std::uint64_t curTicks = mach_absolute_time();
-                        if (curTicks >= wakeTicks) {
-                            break;
-                        }
-                        if (wakeTicks - curTicks > pauseThresholdTicks) {
-                            PreciseSpinPause();
-                        }
-                    }
-                }
+    if (useMachSpinTicks) {
+        const auto& tb = PreciseMachTimebase();
+        const std::uint64_t pauseThresholdTicks =
+            (200ULL * tb.denom + tb.numer - 1ULL) / tb.numer;
+        for (;;) {
+            const std::uint64_t curTicks = mach_absolute_time();
+            if (curTicks >= machSpinDeadlineTicks) {
+                break;
+            }
+            if (machSpinDeadlineTicks - curTicks > pauseThresholdTicks) {
+                PreciseSpinPause();
             }
         }
     } else {

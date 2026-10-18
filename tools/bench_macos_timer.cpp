@@ -133,6 +133,8 @@ struct ModeAccumulator {
     std::vector<double> v_cal_spin_cpu;
     std::vector<double> v_cal_total_cpu;
 
+    std::vector<double> round_p50_wall;
+
     PercentileStats s_total_wall;
     PercentileStats s_total_overshoot;
     PercentileStats s_sleep_wall;
@@ -299,8 +301,8 @@ inline void RunModeSlice(
         std::string status = "OFF";
 #if defined(__APPLE__)
         if (acc.config.enable_policy) {
-            mach_timebase_info_data_t tb;
-            if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer > 0 && tb.denom > 0) {
+            const auto& tb = PreciseMachTimebase();
+            if (tb.numer > 0 && tb.denom > 0) {
                 thread_time_constraint_policy_data_t policy;
                 const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
                 const uint64_t compUs = acc.config.policy_computation_us > 0 ? acc.config.policy_computation_us : 500;
@@ -354,6 +356,9 @@ inline void RunModeSlice(
         const double target_us = static_cast<double>(sleep_micros);
         const std::uint64_t target_nanos = sleep_micros * 1000ULL;
         const std::uint64_t expected_tail_nanos = acc.config.enable_policy ? 200000ULL : 500000ULL;
+
+        std::vector<double> slice_wall;
+        slice_wall.reserve(sample_count);
 
         for (int i = 0; i < sample_count; ++i) {
             PreciseSleepUs(sleep_micros);
@@ -413,6 +418,8 @@ inline void RunModeSlice(
                 acc.outliers_count++;
             }
 
+            slice_wall.push_back(total_w);
+
             acc.v_total_wall.push_back(total_w);
             acc.v_total_overshoot.push_back(total_overshoot);
             acc.v_sleep_wall.push_back(sleep_w);
@@ -430,6 +437,10 @@ inline void RunModeSlice(
             acc.v_cal_overshoot.push_back(cal_overshoot);
             acc.v_cal_spin_cpu.push_back(cal_spin_c);
             acc.v_cal_total_cpu.push_back(cal_total_c);
+        }
+
+        if (!slice_wall.empty()) {
+            acc.round_p50_wall.push_back(ComputeStats(slice_wall).p50);
         }
 
         g_preciseWaitTraceActive = false;
@@ -506,6 +517,35 @@ inline ClockProbeStats MeasureClockProbe(int type, int chunks = 1000, int per_ch
     return ClockProbeStats{s.min_val, s.p50, s.p90, s.p99, s.mean, s.max_val};
 }
 
+inline ClockProbeStats MeasureSingleReadProbe(int type, int count = 10000) {
+    std::vector<double> v;
+    v.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        const auto t0 = Clock::now();
+        if (type == 0) {
+            struct timespec ts{};
+#if defined(CLOCK_MONOTONIC_RAW)
+            clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#endif
+            DoNotOptimize(ts.tv_nsec);
+        } else if (type == 1) {
+#if defined(__APPLE__)
+            const uint64_t ticks = mach_absolute_time();
+            DoNotOptimize(ticks);
+#endif
+        } else if (type == 2) {
+#if defined(__APPLE__) && defined(CLOCK_MONOTONIC_RAW)
+            const uint64_t ns = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+            DoNotOptimize(ns);
+#endif
+        }
+        const auto t1 = Clock::now();
+        v.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count());
+    }
+    const auto s = ComputeStats(v);
+    return ClockProbeStats{s.min_val, s.p50, s.p90, s.p99, s.mean, s.max_val};
+}
+
 struct ClockSpinAccumulator {
     int clock_type;
     std::string clock_name;
@@ -529,12 +569,14 @@ inline void RunClockSpinSlice(
     int warmup_count,
     int sample_count,
     mach_timebase_info_data_t tb) {
+    (void)tb;
     std::thread worker([&] {
 #if defined(__APPLE__)
-        if (tb.numer > 0) {
+        const auto& actual_tb = PreciseMachTimebase();
+        if (actual_tb.numer > 0 && actual_tb.denom > 0) {
             thread_time_constraint_policy_data_t policy;
-            const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
-            const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
+            const uint64_t periodTicks = (1000000ULL * actual_tb.denom) / actual_tb.numer;
+            const uint64_t computationTicks = (500000ULL * actual_tb.denom) / actual_tb.numer;
             if (periodTicks <= UINT32_MAX && computationTicks <= UINT32_MAX) {
                 policy.period = static_cast<uint32_t>(periodTicks);
                 policy.computation = static_cast<uint32_t>(computationTicks);
@@ -552,9 +594,14 @@ inline void RunClockSpinSlice(
 #endif
         const uint64_t target_nanos = acc.target_micros * 1000ULL;
         const double target_us = static_cast<double>(acc.target_micros);
-        const uint64_t mach_delta_ticks = (acc.clock_type == 1 && tb.numer > 0)
-            ? (target_nanos * tb.denom + tb.numer - 1ULL) / tb.numer
+#if defined(__APPLE__)
+        const auto& spin_tb = PreciseMachTimebase();
+        const uint64_t mach_delta_ticks = (acc.clock_type == 1 && spin_tb.numer > 0)
+            ? (target_nanos * spin_tb.denom + spin_tb.numer - 1ULL) / spin_tb.numer
             : 0ULL;
+#else
+        const uint64_t mach_delta_ticks = 0ULL;
+#endif
 
         auto do_spin = [&]() {
             if (acc.clock_type == 0) {
@@ -706,7 +753,7 @@ int main() {
            << "n/a |\n\n";
 #endif
 
-    report << "#### 3. Raw Measurements: 2x2 Matrix for PreciseSleepUs(1500) (10 Interleaved Rounds, 1000 Samples per Mode)\n\n";
+    report << "#### 3. Raw Measurements: 2x2 Matrix for PreciseSleepUs(1500) (10 Interleaved Rounds, 5000 Samples per Mode)\n\n";
 
     std::vector<ModeAccumulator> modes;
     modes.push_back(ModeAccumulator{{PreciseWaitBackend::Nanosleep, false, "nanosleep"}});
@@ -719,7 +766,7 @@ int main() {
     const size_t num_modes = modes.size();
     const int kRounds = 10;
     const int kWarmupPerRound = 10;
-    const int kSamplesPerRound = 100;
+    const int kSamplesPerRound = 500;
 
     const std::vector<std::vector<int>> round_permutations = {
         {0, 1, 2, 3},
@@ -771,6 +818,18 @@ int main() {
                << m.syscall_errors << " | "
                << m.policy_failures << " | "
                << m.invalid_samples << " |\n";
+    }
+    report << "\n";
+
+    report << "##### 3.1 Per-Round Wall p50 Breakdown (10 Rounds, 500 Samples/Round, Interleaved)\n\n";
+    report << "| Backend | Policy | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 | Overall p50 |\n";
+    report << "|---|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (const auto& m : modes) {
+        report << "| `" << m.config.backend_name << "` | " << (m.config.enable_policy ? "**ON**" : "OFF") << " | ";
+        for (double r_p50 : m.round_p50_wall) {
+            report << std::fixed << std::setprecision(1) << r_p50 << " µs | ";
+        }
+        report << m.s_total_wall.p50 << " µs |\n";
     }
     report << "\n";
 
@@ -839,7 +898,29 @@ int main() {
 #if defined(__APPLE__)
     report << "#### 6. Clock Source Comparison (Probe Latency & Spin Loop)\n\n";
 
-    report << "##### 6.1 Single Read Probe Latency (100k samples, 1000 chunks x 100 reads)\n\n";
+    report << "##### 6.1a Direct Single Read Latency Distribution (10k individual unrolled invocations)\n\n";
+    report << "| Clock Source | Min Latency | p50 Latency | p90 Latency | p99 Latency | Mean Latency | Max Latency |\n";
+    report << "|---|---:|---:|---:|---:|---:|---:|\n";
+
+    const auto s_gettime = MeasureSingleReadProbe(0);
+    const auto s_mach = MeasureSingleReadProbe(1);
+    const auto s_np = MeasureSingleReadProbe(2);
+
+    report << "| `clock_gettime(CLOCK_MONOTONIC_RAW)` | "
+           << std::fixed << std::setprecision(1)
+           << s_gettime.min_ns << " ns | " << s_gettime.p50_ns << " ns | "
+           << s_gettime.p90_ns << " ns | " << s_gettime.p99_ns << " ns | "
+           << s_gettime.mean_ns << " ns | " << s_gettime.max_ns << " ns |\n";
+    report << "| `mach_absolute_time()` | "
+           << s_mach.min_ns << " ns | " << s_mach.p50_ns << " ns | "
+           << s_mach.p90_ns << " ns | " << s_mach.p99_ns << " ns | "
+           << s_mach.mean_ns << " ns | " << s_mach.max_ns << " ns |\n";
+    report << "| `clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)` | "
+           << s_np.min_ns << " ns | " << s_np.p50_ns << " ns | "
+           << s_np.p90_ns << " ns | " << s_np.p99_ns << " ns | "
+           << s_np.mean_ns << " ns | " << s_np.max_ns << " ns |\n\n";
+
+    report << "##### 6.1b Amortized Per-Read Latency (Throughput: 100k samples, 1000 chunks x 100 reads)\n\n";
     report << "| Clock Source | Min Latency | p50 Latency | p90 Latency | p99 Latency | Mean Latency | Max Latency |\n";
     report << "|---|---:|---:|---:|---:|---:|---:|\n";
 
@@ -916,9 +997,9 @@ int main() {
         }
     }
 
-    report << "#### 7. Spin Loop Strategy Comparison: `clock_gettime` vs `mach_absolute_time` (Policy ON, 200 µs tail, PreciseSleepUs(1500))\n\n";
-    report << "| Backend | Spin Strategy | Wall p50 | Wall p90 | Wall p99 | Wall Max | Overshoot p50 | Total CPU p50 | Spin CPU p50 | Spin Wall p50 | Outliers (>1650µs) | Early |\n";
-    report << "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n";
+    report << "#### 7. Spin Loop Strategy Comparison: `clock_gettime` vs `mach_absolute_time` (Policy ON, 200 µs tail, PreciseSleepUs(1500), 5000 Samples per Mode)\n\n";
+    report << "| Backend | Policy Status | Spin Strategy | Wall p50 | Wall p90 | Wall p99 | Wall Max | Overshoot p50 | Total CPU p50 | Spin CPU p50 | Spin Wall p50 | Outliers (>1650µs) | Early |\n";
+    report << "|---|:---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n";
 
     std::vector<ModeAccumulator> spin_strategy_modes;
     spin_strategy_modes.push_back(ModeAccumulator{ModeConfig{PreciseWaitBackend::Nanosleep, true, "nanosleep", PreciseWaitSpinLoop::MonotonicNanos, 500}});
@@ -927,16 +1008,21 @@ int main() {
     spin_strategy_modes.push_back(ModeAccumulator{ModeConfig{PreciseWaitBackend::MachWaitUntil, true, "mach_wait_until", PreciseWaitSpinLoop::MachTicks, 500}});
 
     const size_t num_spin_modes = spin_strategy_modes.size();
-    const int kSpinStrategyRounds = 5;
-    const int kSpinStrategyWarmup = 5;
-    const int kSpinStrategySamples = 40;
+    const int kSpinStrategyRounds = 10;
+    const int kSpinStrategyWarmup = 10;
+    const int kSpinStrategySamples = 500;
 
     const std::vector<std::vector<int>> spin_permutations = {
         {0, 1, 2, 3},
         {3, 2, 1, 0},
         {1, 3, 0, 2},
         {2, 0, 3, 1},
-        {0, 2, 1, 3}
+        {0, 2, 3, 1},
+        {3, 1, 0, 2},
+        {2, 3, 1, 0},
+        {1, 0, 2, 3},
+        {0, 3, 1, 2},
+        {2, 1, 0, 3}
     };
 
     for (int r = 0; r < kSpinStrategyRounds; ++r) {
@@ -956,7 +1042,9 @@ int main() {
         const std::string strat_name = (sm.config.spin_loop == PreciseWaitSpinLoop::MachTicks)
             ? "`mach_absolute_time` ticks"
             : "`clock_gettime` nanos";
-        report << "| `" << sm.config.backend_name << "` | " << strat_name << " | "
+        report << "| `" << sm.config.backend_name << "` | "
+               << sm.policy_status << " | "
+               << strat_name << " | "
                << std::fixed << std::setprecision(1)
                << sm.s_total_wall.p50 << " µs | "
                << sm.s_total_wall.p90 << " µs | "
@@ -968,6 +1056,21 @@ int main() {
                << sm.s_spin_wall.p50 << " µs | "
                << sm.outliers_count << " / " << sm.total_samples << " | "
                << sm.early_returns << " |\n";
+    }
+    report << "\n";
+
+    report << "##### 7.1 Per-Round Wall p50 Breakdown (10 Rounds, 500 Samples/Round, Interleaved)\n\n";
+    report << "| Backend | Strategy | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 | Overall p50 |\n";
+    report << "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (const auto& sm : spin_strategy_modes) {
+        const std::string strat_name = (sm.config.spin_loop == PreciseWaitSpinLoop::MachTicks)
+            ? "mach_ticks"
+            : "monotonic_nanos";
+        report << "| `" << sm.config.backend_name << "` | `" << strat_name << "` | ";
+        for (double r_p50 : sm.round_p50_wall) {
+            report << std::fixed << std::setprecision(1) << r_p50 << " µs | ";
+        }
+        report << sm.s_total_wall.p50 << " µs |\n";
     }
     report << "\n";
 
@@ -986,9 +1089,9 @@ int main() {
         }
     }
 
-    report << "#### 8. Policy Computation Budget Sweep: 250 µs vs 350 µs vs 500 µs (Fixed 200 µs Spin Tail, PreciseSleepUs(1500))\n\n";
-    report << "| Backend | Budget | Wall p50 | Wall p90 | Wall p99 | Wall Max | Overshoot p50 | Total CPU p50 | Syscall Wall p50 | Syscall Overshoot p50 | Outliers (>1650µs) | Early |\n";
-    report << "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n";
+    report << "#### 8. Policy Computation Budget Sweep: 250 µs vs 350 µs vs 500 µs (Fixed 200 µs Spin Tail, PreciseSleepUs(1500), 5000 Samples per Mode)\n\n";
+    report << "| Backend | Budget | Policy Status | Wall p50 | Wall p90 | Wall p99 | Wall Max | Total CPU p50 | Spin CPU p50 | Spin CPU p90 | Spin CPU p99 | Syscall Wall p50 | Syscall Wall p90 | Syscall Wall p99 | Syscall Overshoot p50 | Syscall Overshoot p90 | Syscall Overshoot p99 | Outliers (>1650µs) | Early |\n";
+    report << "|---|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n";
 
     std::vector<ModeAccumulator> budget_modes;
     for (const uint32_t comp_us : {250U, 350U, 500U}) {
@@ -999,16 +1102,21 @@ int main() {
     }
 
     const size_t num_budget_modes = budget_modes.size();
-    const int kBudgetRounds = 5;
-    const int kBudgetWarmup = 5;
-    const int kBudgetSamples = 40;
+    const int kBudgetRounds = 10;
+    const int kBudgetWarmup = 10;
+    const int kBudgetSamples = 500;
 
     const std::vector<std::vector<int>> budget_permutations = {
         {0, 1, 2, 3, 4, 5},
         {5, 4, 3, 2, 1, 0},
         {1, 3, 5, 0, 2, 4},
         {4, 2, 0, 5, 3, 1},
-        {2, 0, 4, 1, 5, 3}
+        {2, 0, 4, 1, 5, 3},
+        {3, 5, 1, 4, 0, 2},
+        {0, 4, 2, 5, 1, 3},
+        {5, 1, 3, 0, 4, 2},
+        {2, 3, 0, 1, 5, 4},
+        {4, 0, 5, 2, 3, 1}
     };
 
     for (int r = 0; r < kBudgetRounds; ++r) {
@@ -1027,17 +1135,36 @@ int main() {
         FinalizeStats(bm);
         report << "| `" << bm.config.backend_name << "` | "
                << bm.config.policy_computation_us << " µs | "
+               << bm.policy_status << " | "
                << std::fixed << std::setprecision(1)
                << bm.s_total_wall.p50 << " µs | "
                << bm.s_total_wall.p90 << " µs | "
                << bm.s_total_wall.p99 << " µs | "
-               << bm.s_total_wall.max_val << " µs | +"
-               << bm.s_total_overshoot.p50 << " µs | "
+               << bm.s_total_wall.max_val << " µs | "
                << bm.s_total_cpu.p50 << " µs | "
-               << bm.s_sleep_wall.p50 << " µs | +"
-               << bm.s_sleep_overshoot.p50 << " µs | "
+               << bm.s_spin_cpu.p50 << " µs | "
+               << bm.s_spin_cpu.p90 << " µs | "
+               << bm.s_spin_cpu.p99 << " µs | "
+               << bm.s_sleep_wall.p50 << " µs | "
+               << bm.s_sleep_wall.p90 << " µs | "
+               << bm.s_sleep_wall.p99 << " µs | +"
+               << bm.s_sleep_overshoot.p50 << " µs | +"
+               << bm.s_sleep_overshoot.p90 << " µs | +"
+               << bm.s_sleep_overshoot.p99 << " µs | "
                << bm.outliers_count << " / " << bm.total_samples << " | "
                << bm.early_returns << " |\n";
+    }
+    report << "\n";
+
+    report << "##### 8.1 Per-Round Wall p50 Breakdown (10 Rounds, 500 Samples/Round, Interleaved)\n\n";
+    report << "| Backend | Budget | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 | Overall p50 |\n";
+    report << "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (const auto& bm : budget_modes) {
+        report << "| `" << bm.config.backend_name << "` | " << bm.config.policy_computation_us << " µs | ";
+        for (double r_p50 : bm.round_p50_wall) {
+            report << std::fixed << std::setprecision(1) << r_p50 << " µs | ";
+        }
+        report << bm.s_total_wall.p50 << " µs |\n";
     }
     report << "\n";
 
