@@ -358,13 +358,13 @@ inline void RunModeSlice(
             g_preciseWaitTraceSample.cpu4 = cpu4;
 
             const auto& s = g_preciseWaitTraceSample;
-            const bool monotonic = (s.t0 <= s.t1) && (s.t1 <= s.t2) && (s.t2 <= s.t3) && (s.t3 <= s.t4);
-            if (!monotonic) {
+            if (s.syscall_return_code != 0) {
+                acc.syscall_errors++;
                 acc.invalid_samples++;
                 continue;
             }
-            if (s.syscall_return_code != 0) {
-                acc.syscall_errors++;
+            const bool monotonic = (s.t0 <= s.t1) && (s.t1 <= s.t2) && (s.t2 <= s.t3) && (s.t3 <= s.t4);
+            if (!monotonic) {
                 acc.invalid_samples++;
                 continue;
             }
