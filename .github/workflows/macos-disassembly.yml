@@ -1,0 +1,153 @@
+name: macOS Disassembly Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Commit SHA to checkout (empty for caller ref)'
+        required: false
+        default: ''
+
+jobs:
+  disassembly:
+    name: ${{ matrix.os }} (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+            artifact_name: macos-arm64-disassembly
+          - os: macos-15-intel
+            arch: x86_64
+            artifact_name: macos-x86_64-disassembly
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha != '' && inputs.commit_sha || github.ref }}
+
+      - name: Create Disassembly Harness and Output Directories
+        run: |
+          mkdir -p output/production output/diagnostic
+          cat << 'EOF' > tools/disasm_precise_wait.cpp
+          #include "prx/libc/include/PreciseWait.hpp"
+
+          extern "C" {
+          void export_PreciseSleepUs(unsigned long long us) {
+              PreciseSleepUs(us);
+          }
+          void export_PreciseSleepNanos(unsigned long long nanos) {
+          #if !defined(_WIN32)
+              PreciseSleepNanos(nanos);
+          #endif
+          }
+          void export_PreciseSleepUntil_steady(std::int64_t nanos) {
+              PreciseSleepUntil(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(nanos)));
+          }
+          bool export_PreciseAppleLowTimerSlack() {
+          #if defined(__APPLE__)
+              return PreciseAppleLowTimerSlack();
+          #else
+              return false;
+          #endif
+          }
+          std::uint64_t export_PreciseSafeDurationToNanos_double(double d) {
+              return PreciseSafeDurationToNanos(std::chrono::duration<double>(d));
+          }
+          std::uint64_t export_PreciseSafeDurationToNanos_int64(std::int64_t d) {
+              return PreciseSafeDurationToNanos(std::chrono::nanoseconds(d));
+          }
+          #if defined(__APPLE__)
+          auto export_PreciseComputeMachDeadline(std::uint64_t nanos, std::uint32_t numer, std::uint32_t denom, std::uint64_t now) {
+              return PreciseComputeMachDeadline(nanos, numer, denom, now);
+          }
+          #endif
+          }
+          EOF
+
+      - name: Gather Toolchain and Environment Metadata
+        run: |
+          META_FILE="output/metadata.txt"
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          echo "=== Commit & Environment Metadata ===" > "$META_FILE"
+          echo "Requested SHA: ${{ inputs.commit_sha }}" >> "$META_FILE"
+          echo "Checked-out SHA: $ACTUAL_SHA" >> "$META_FILE"
+          echo "Git Branch/Ref: ${{ github.ref }}" >> "$META_FILE"
+          echo "Date (UTC): $(date -u)" >> "$META_FILE"
+          echo "Architecture (uname -m): $(uname -m)" >> "$META_FILE"
+          echo "Kernel (uname -a): $(uname -a)" >> "$META_FILE"
+          echo "" >> "$META_FILE"
+          echo "OS Version (sw_vers):" >> "$META_FILE"
+          sw_vers >> "$META_FILE" 2>&1 || true
+          echo "" >> "$META_FILE"
+          echo "macOS SDK Version:" >> "$META_FILE"
+          xcrun --show-sdk-version >> "$META_FILE" 2>&1 || true
+          echo "macOS SDK Path:" >> "$META_FILE"
+          xcrun --show-sdk-path >> "$META_FILE" 2>&1 || true
+          echo "" >> "$META_FILE"
+          echo "Clang Version:" >> "$META_FILE"
+          clang++ --version >> "$META_FILE" 2>&1 || true
+          echo "" >> "$META_FILE"
+          echo "Production Compiler Flags:" >> "$META_FILE"
+          echo "clang++ -std=c++20 -O3 -DNDEBUG -arch ${{ matrix.arch }} -Icore/libs" >> "$META_FILE"
+          echo "Diagnostic Compiler Flags:" >> "$META_FILE"
+          echo "clang++ -std=c++20 -O3 -DNDEBUG -g -arch ${{ matrix.arch }} -Icore/libs" >> "$META_FILE"
+
+      - name: Build and Disassemble Production Variant (-O3 -DNDEBUG)
+        run: |
+          ARCH="${{ matrix.arch }}"
+          PROD_DIR="output/production"
+
+          echo "=== Compiling Production PreciseWait ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -c -o "$PROD_DIR/precise_wait.o"
+          clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -S -o "$PROD_DIR/precise_wait.s"
+
+          echo "=== Disassembling Production PreciseWait ==="
+          xcrun llvm-objdump --macho --disassemble --demangle --arch "$ARCH" "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.${ARCH}.asm.txt"
+          xcrun otool -tvV -arch "$ARCH" "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.${ARCH}.otool.txt"
+          nm -nm "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.symbols.txt"
+
+          if [ -f "tools/bench_macos_timer.cpp" ]; then
+            echo "=== Compiling Production bench_macos ==="
+            clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -o "$PROD_DIR/bench_macos"
+            clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -S -o "$PROD_DIR/bench_macos.s"
+
+            echo "=== Disassembling Production bench_macos ==="
+            xcrun llvm-objdump --macho --disassemble --demangle --arch "$ARCH" "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.${ARCH}.asm.txt"
+            xcrun otool -tvV -arch "$ARCH" "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.${ARCH}.otool.txt"
+            nm -nm "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.symbols.txt"
+          fi
+
+      - name: Build and Disassemble Diagnostic Variant (-O3 -DNDEBUG -g)
+        run: |
+          ARCH="${{ matrix.arch }}"
+          DIAG_DIR="output/diagnostic"
+
+          echo "=== Compiling Diagnostic PreciseWait (-g) ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -g -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -c -o "$DIAG_DIR/precise_wait_diag.o"
+          clang++ -std=c++20 -O3 -DNDEBUG -g -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -S -o "$DIAG_DIR/precise_wait_diag.s"
+
+          echo "=== Disassembling Diagnostic PreciseWait with Source Correlation ==="
+          xcrun llvm-objdump --macho --disassemble --demangle --source --arch "$ARCH" "$DIAG_DIR/precise_wait_diag.o" > "$DIAG_DIR/precise_wait_diag.${ARCH}.source_asm.txt"
+          xcrun otool -tvV -arch "$ARCH" "$DIAG_DIR/precise_wait_diag.o" > "$DIAG_DIR/precise_wait_diag.${ARCH}.otool.txt"
+          nm -nm "$DIAG_DIR/precise_wait_diag.o" > "$DIAG_DIR/precise_wait_diag.symbols.txt"
+
+          if [ -f "tools/bench_macos_timer.cpp" ]; then
+            echo "=== Compiling Diagnostic bench_macos (-g) ==="
+            clang++ -std=c++20 -O3 -DNDEBUG -g -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -o "$DIAG_DIR/bench_macos_diag"
+            clang++ -std=c++20 -O3 -DNDEBUG -g -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -S -o "$DIAG_DIR/bench_macos_diag.s"
+
+            echo "=== Disassembling Diagnostic bench_macos with Source Correlation ==="
+            xcrun llvm-objdump --macho --disassemble --demangle --source --arch "$ARCH" "$DIAG_DIR/bench_macos_diag" > "$DIAG_DIR/bench_macos_diag.${ARCH}.source_asm.txt"
+            xcrun otool -tvV -arch "$ARCH" "$DIAG_DIR/bench_macos_diag" > "$DIAG_DIR/bench_macos_diag.${ARCH}.otool.txt"
+            nm -nm "$DIAG_DIR/bench_macos_diag" > "$DIAG_DIR/bench_macos_diag.symbols.txt"
+          fi
+
+      - name: Upload Disassembly Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: output/
+          if-no-files-found: error
