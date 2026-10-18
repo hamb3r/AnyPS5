@@ -110,6 +110,7 @@ struct ModeAccumulator {
     std::uint64_t outliers_count = 0;
     std::uint64_t total_eintr = 0;
     std::uint64_t syscall_errors = 0;
+    std::uint64_t policy_failures = 0;
     std::uint64_t invalid_samples = 0;
 
     std::vector<double> v_total_wall;
@@ -326,13 +327,19 @@ inline void RunModeSlice(
             }
         }
 #endif
-        if (acc.policy_status.empty()) {
+        if (acc.config.enable_policy) {
+            if (status != "ON (kr=0)") {
+                acc.policy_failures++;
+            }
             acc.policy_status = status;
-            const bool lowSlack = (status.rfind("ON", 0) == 0);
-            acc.spin_tail_us = lowSlack ? 200 : 500;
+            acc.spin_tail_us = 200;
+        } else {
+            acc.policy_status = "OFF";
+            acc.spin_tail_us = 500;
         }
 
         g_preciseWaitTraceBackend = acc.config.backend;
+        g_preciseWaitTraceAllowLowSlack = acc.config.enable_policy;
         g_preciseWaitTraceActive = true;
 
         for (int i = 0; i < warmup_count; ++i) {
@@ -341,6 +348,7 @@ inline void RunModeSlice(
 
         const double target_us = static_cast<double>(sleep_micros);
         const std::uint64_t target_nanos = sleep_micros * 1000ULL;
+        const std::uint64_t expected_tail_nanos = acc.config.enable_policy ? 200000ULL : 500000ULL;
 
         for (int i = 0; i < sample_count; ++i) {
             PreciseSleepUs(sleep_micros);
@@ -357,6 +365,10 @@ inline void RunModeSlice(
             }
             if (s.syscall_return_code != 0) {
                 acc.syscall_errors++;
+                acc.invalid_samples++;
+                continue;
+            }
+            if (s.spin_tail_nanos != expected_tail_nanos) {
                 acc.invalid_samples++;
                 continue;
             }
@@ -384,10 +396,10 @@ inline void RunModeSlice(
             const double total_overshoot = total_w - target_us;
             const double spin_unacc = (spin_w >= spin_c) ? (spin_w - spin_c) : 0.0;
 
-            const double cal_total_w = std::max(target_us, total_w - probe_total_w_p50);
+            const double cal_total_w = total_w - probe_total_w_p50;
             const double cal_overshoot = total_overshoot - probe_total_w_p50;
-            const double cal_spin_c = std::max(0.0, spin_c - probe_spin_c_p50);
-            const double cal_total_c = std::max(0.0, total_c - probe_total_c_p50);
+            const double cal_spin_c = spin_c - probe_spin_c_p50;
+            const double cal_total_c = total_c - probe_total_c_p50;
 
             if (s.t4 < s.t0 + target_nanos) {
                 acc.early_returns++;
@@ -576,8 +588,8 @@ int main() {
         FinalizeStats(m);
     }
 
-    report << "| Backend | Policy | Spin Tail | Wall p50 | Wall p90 | Wall p99 | Wall Max | Wall Mean | Overshoot p50 | Total CPU p50 | Spin CPU p50 | Outliers (>1650µs) | Early | Syscall Errors | Invalid |\n";
-    report << "|---|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|:---:|\n";
+    report << "| Backend | Policy | Spin Tail | Wall p50 | Wall p90 | Wall p99 | Wall Max | Wall Mean | Overshoot p50 | Total CPU p50 | Spin CPU p50 | Outliers (>1650µs) | Early | Syscall Errors | Policy Failures | Invalid |\n";
+    report << "|---|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|:---:|:---:|\n";
 
     for (const auto& m : modes) {
         report << "| `" << m.config.backend_name << "` | "
@@ -595,19 +607,20 @@ int main() {
                << m.outliers_count << " / " << m.total_samples << " | "
                << m.early_returns << " | "
                << m.syscall_errors << " | "
+               << m.policy_failures << " | "
                << m.invalid_samples << " |\n";
     }
     report << "\n";
 
-    report << "#### 4. Calibrated Measurements (Probe Baseline Subtracted)\n\n";
+    report << "#### 4. Calibrated Measurements (Probe Baseline Subtracted, Unclamped)\n\n";
     report << "| Backend | Policy | Calibrated Overshoot p50 | Calibrated Wall p50 | Calibrated Wall p90 | Calibrated Wall p99 | Calibrated Spin CPU p50 | Calibrated Total CPU p50 |\n";
     report << "|---|:---:|---:|---:|---:|---:|---:|---:|\n";
 
     for (const auto& m : modes) {
         report << "| `" << m.config.backend_name << "` | "
-               << (m.config.enable_policy ? "**ON**" : "OFF") << " | +"
+               << (m.config.enable_policy ? "**ON**" : "OFF") << " | "
                << std::fixed << std::setprecision(1)
-               << m.s_cal_overshoot.p50 << " µs | "
+               << (m.s_cal_overshoot.p50 >= 0 ? "+" : "") << m.s_cal_overshoot.p50 << " µs | "
                << m.s_cal_wall.p50 << " µs | "
                << m.s_cal_wall.p90 << " µs | "
                << m.s_cal_wall.p99 << " µs | "
@@ -677,6 +690,14 @@ int main() {
         }
         if (m.syscall_errors > 0) {
             std::cerr << "FATAL: Mode " << m.config.backend_name << " encountered syscall errors!\n";
+            return 1;
+        }
+        if (m.policy_failures > 0) {
+            std::cerr << "FATAL: Mode " << m.config.backend_name << " encountered policy failures!\n";
+            return 1;
+        }
+        if (m.invalid_samples > 0) {
+            std::cerr << "FATAL: Mode " << m.config.backend_name << " encountered invalid samples!\n";
             return 1;
         }
     }
