@@ -96,6 +96,28 @@ int main() {
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::pico>(1001)) == 2ULL);
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<1, 3>>(1)) == 333333334ULL);
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<1, 1000000000000000000LL>>(1000000000LL)) == 1ULL);
+    static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<INTMAX_MAX, 1>>(1)) == UINT64_MAX);
+    static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<INTMAX_MAX, 1>>(0)) == 0ULL);
+    static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<INTMAX_MAX, 1>>(-5)) == 0ULL);
+    static_assert(PreciseSafeDurationToNanos(std::chrono::duration<double, std::ratio<INTMAX_MAX, 1>>(1.0)) == UINT64_MAX);
+    static_assert(PreciseSafeDurationToNanos(std::chrono::duration<double, std::ratio<INTMAX_MAX, 1>>(-1.0)) == 0ULL);
+
+    static_assert(PreciseMulDivCeilFallback64(0, 100, 10) == 0ULL);
+    static_assert(PreciseMulDivCeilFallback64(10, 100, 10) == 100ULL);
+    static_assert(PreciseMulDivCeilFallback64(1, 1, 3) == 1ULL);
+    static_assert(PreciseMulDivCeilFallback64(5, 1000, 2000) == 3ULL);
+    static_assert(PreciseMulDivCeilFallback64(1000000000000000ULL, 1000000000000000ULL, 10000000000000000ULL) == 100000000000000ULL);
+    static_assert(PreciseMulDivCeil64(1000000000000000ULL, 1000000000000000ULL, 10000000000000000ULL) == 100000000000000ULL);
+    static_assert(PreciseMulDivCeilFallback64(UINT64_MAX, 10, 1) == UINT64_MAX);
+    static_assert(PreciseMulDivCeilFallback64(UINT64_MAX, 1, 1) == UINT64_MAX);
+    static_assert(PreciseMulDivCeilFallback64(UINT64_MAX, UINT64_MAX, UINT64_MAX) == UINT64_MAX);
+    static_assert(PreciseMulDivCeilFallback64(UINT64_MAX, UINT64_MAX, 1) == UINT64_MAX);
+    static_assert(PreciseMulDivCeilFallback64(1, UINT64_MAX, UINT64_MAX) == 1ULL);
+    static_assert(PreciseMulDivCeilFallback64(2, UINT64_MAX, UINT64_MAX) == 2ULL);
+    static_assert(PreciseMulDivCeilFallback64(10, UINT64_MAX, 10) == UINT64_MAX);
+    static_assert(PreciseMulDivCeilFallback64(UINT64_MAX / 2ULL + 1ULL, 3, 2) == 13835058055282163712ULL);
+    static_assert(PreciseMulDivCeilFallback64(UINT64_MAX - 100ULL, 3, 2) == UINT64_MAX);
+    static_assert(PreciseMulDivCeilFallback64(1ULL << 62, 1ULL << 62, 1ULL << 62) == 1ULL << 62);
 
     static_assert(PreciseMulDivCeil64(0, 100, 10) == 0ULL);
     static_assert(PreciseMulDivCeil64(10, 100, 10) == 100ULL);
@@ -179,6 +201,37 @@ int main() {
             return 1;
         }
     }
+
+#if defined(__SIZEOF_INT128__) && !defined(_WIN32)
+    for (const auto& [r, num, den] : {
+             std::tuple{0ULL, 100ULL, 10ULL},
+             std::tuple{10ULL, 0ULL, 10ULL},
+             std::tuple{10ULL, 10ULL, 0ULL},
+             std::tuple{1ULL, 1ULL, 1ULL},
+             std::tuple{1ULL, 1ULL, 3ULL},
+             std::tuple{5ULL, 1000ULL, 2000ULL},
+             std::tuple{1000000000000000ULL, 1000000000000000ULL, 10000000000000000ULL},
+             std::tuple{UINT64_MAX, 1ULL, 1ULL},
+             std::tuple{UINT64_MAX, 2ULL, 1ULL},
+             std::tuple{UINT64_MAX, 10ULL, 2ULL},
+             std::tuple{UINT64_MAX, UINT64_MAX, UINT64_MAX},
+             std::tuple{UINT64_MAX, UINT64_MAX, 1ULL},
+             std::tuple{1ULL, UINT64_MAX, UINT64_MAX},
+             std::tuple{2ULL, UINT64_MAX, UINT64_MAX},
+             std::tuple{10ULL, UINT64_MAX, 10ULL},
+             std::tuple{UINT64_MAX, 10ULL, 10ULL},
+             std::tuple{UINT64_MAX / 2ULL + 1ULL, 3ULL, 2ULL},
+             std::tuple{UINT64_MAX - 100ULL, 3ULL, 2ULL},
+             std::tuple{1ULL << 63, 1ULL << 63, 1ULL << 62},
+             std::tuple{1ULL << 62, 1ULL << 62, 1ULL << 62}}) {
+        const std::uint64_t f1 = PreciseMulDivCeilFallback64(r, num, den);
+        const std::uint64_t f2 = PreciseMulDivCeil64(r, num, den);
+        if (f1 != f2) {
+            std::cerr << "PreciseMulDivCeilFallback64 vs PreciseMulDivCeil64 mismatch\n";
+            return 1;
+        }
+    }
+#endif
 
     for (const std::uint64_t freq : {3579545ULL, 10000000ULL, 14318180ULL, 19200000ULL, 24000000ULL}) {
         for (const unsigned long long hundredNanos : {1ULL, 5ULL, 100ULL, 300ULL, 500ULL, 10000ULL, 53330ULL}) {

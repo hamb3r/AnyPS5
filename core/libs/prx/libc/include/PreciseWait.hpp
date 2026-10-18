@@ -28,46 +28,107 @@ struct PreciseMachDeadlineResult {
     std::uint64_t wakeDeadline{0};
 };
 
-inline constexpr std::uint64_t PreciseMulDivCeil64(std::uint64_t r, std::uint64_t num, std::uint64_t den) {
+inline constexpr std::uint64_t PreciseGcd(std::uint64_t a, std::uint64_t b) {
+    while (b != 0) {
+        const std::uint64_t t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+template <class Period>
+struct PreciseSafeNanoRatio {
+    static constexpr std::uint64_t p_num = static_cast<std::uint64_t>(Period::num);
+    static constexpr std::uint64_t p_den = static_cast<std::uint64_t>(Period::den);
+    static constexpr std::uint64_t g1 = PreciseGcd(p_den, 1000000000ULL);
+    static constexpr std::uint64_t k1 = 1000000000ULL / g1;
+    static constexpr std::uint64_t d1 = p_den / g1;
+    static constexpr std::uint64_t g2 = PreciseGcd(p_num, d1);
+    static constexpr std::uint64_t n2 = p_num / g2;
+    static constexpr std::uint64_t den = d1 / g2;
+    static constexpr bool overflows_tick = (n2 > UINT64_MAX / k1);
+    static constexpr std::uint64_t num = overflows_tick ? UINT64_MAX : (n2 * k1);
+};
+
+inline constexpr std::uint64_t PreciseMulDivCeilFallback64(std::uint64_t r, std::uint64_t num, std::uint64_t den) {
     if (r == 0 || num == 0 || den == 0) {
         return 0ULL;
     }
-    if (r <= UINT64_MAX / num) {
-        const std::uint64_t prod = r * num;
-        return (prod / den) + ((prod % den != 0) ? 1ULL : 0ULL);
+    const std::uint64_t wholeQ = r / den;
+    const std::uint64_t remR = r % den;
+    if (wholeQ > 0 && num > UINT64_MAX / wholeQ) {
+        return UINT64_MAX;
     }
-#if defined(__SIZEOF_INT128__) && !defined(_WIN32)
-    const unsigned __int128 prod = static_cast<unsigned __int128>(r) * num;
-    const unsigned __int128 q = prod / den;
-    const unsigned __int128 rem = prod % den;
-    const unsigned __int128 res = q + (rem != 0 ? 1 : 0);
-    return res > UINT64_MAX ? UINT64_MAX : static_cast<std::uint64_t>(res);
-#else
+    const std::uint64_t base = wholeQ * num;
+    if (remR == 0) {
+        return base;
+    }
+    if (remR <= UINT64_MAX / num) {
+        const std::uint64_t prod = remR * num;
+        const std::uint64_t q = prod / den;
+        const std::uint64_t rem = prod % den;
+        const std::uint64_t extra = q + (rem != 0 ? 1ULL : 0ULL);
+        if (UINT64_MAX - base < extra) {
+            return UINT64_MAX;
+        }
+        return base + extra;
+    }
     std::uint64_t q = 0;
     std::uint64_t rem = 0;
     const std::uint64_t addQ = num / den;
     const std::uint64_t addR = num % den;
     for (int i = 63; i >= 0; --i) {
-        if ((r >> i) & 1ULL) {
+        if ((remR >> i) & 1ULL) {
+            if (UINT64_MAX - q < addQ) {
+                return UINT64_MAX;
+            }
             q += addQ;
             if (den - rem <= addR) {
-                q += 1;
+                if (q == UINT64_MAX) {
+                    return UINT64_MAX;
+                }
+                q += 1ULL;
                 rem = addR - (den - rem);
             } else {
                 rem += addR;
             }
         }
         if (i > 0) {
+            if (q > UINT64_MAX / 2ULL) {
+                return UINT64_MAX;
+            }
             q <<= 1;
             if (rem >= den - rem) {
-                q += 1;
+                if (q == UINT64_MAX) {
+                    return UINT64_MAX;
+                }
+                q += 1ULL;
                 rem = rem - (den - rem);
             } else {
                 rem <<= 1;
             }
         }
     }
-    return q + (rem != 0 ? 1ULL : 0ULL);
+    const std::uint64_t extra = q + (rem != 0 ? 1ULL : 0ULL);
+    if (UINT64_MAX - base < extra) {
+        return UINT64_MAX;
+    }
+    return base + extra;
+}
+
+inline constexpr std::uint64_t PreciseMulDivCeil64(std::uint64_t r, std::uint64_t num, std::uint64_t den) {
+#if defined(__SIZEOF_INT128__) && !defined(_WIN32)
+    if (r == 0 || num == 0 || den == 0) {
+        return 0ULL;
+    }
+    const unsigned __int128 prod = static_cast<unsigned __int128>(r) * num;
+    const unsigned __int128 q = prod / den;
+    const unsigned __int128 rem = prod % den;
+    const unsigned __int128 res = q + (rem != 0 ? 1 : 0);
+    return res > UINT64_MAX ? UINT64_MAX : static_cast<std::uint64_t>(res);
+#else
+    return PreciseMulDivCeilFallback64(r, num, den);
 #endif
 }
 
@@ -135,23 +196,29 @@ template <class Rep, class Period>
 constexpr std::uint64_t PreciseSafeDurationToNanos(const std::chrono::duration<Rep, Period>& d) {
     if constexpr (std::is_floating_point_v<Rep>) {
         const Rep c = d.count();
-        if (std::isnan(c) || !(c > static_cast<Rep>(0))) {
+        if (c != c || !(c > static_cast<Rep>(0))) {
             return 0ULL;
         }
-        if (std::isinf(c)) {
+        if (c > std::numeric_limits<Rep>::max() || PreciseSafeNanoRatio<Period>::overflows_tick) {
             return UINT64_MAX;
         }
-        using NanoRatio = std::ratio_divide<Period, std::nano>;
-        constexpr double num = static_cast<double>(NanoRatio::num);
-        constexpr double den = static_cast<double>(NanoRatio::den);
+        constexpr double num = static_cast<double>(PreciseSafeNanoRatio<Period>::num);
+        constexpr double den = static_cast<double>(PreciseSafeNanoRatio<Period>::den);
         const double scaled = static_cast<double>(c) * (num / den);
-        if (std::isinf(scaled) || scaled >= static_cast<double>(UINT64_MAX)) {
+        if (scaled > std::numeric_limits<double>::max() || scaled >= static_cast<double>(UINT64_MAX)) {
             return UINT64_MAX;
         }
-        return static_cast<std::uint64_t>(std::ceil(scaled));
+        const std::uint64_t floorVal = static_cast<std::uint64_t>(scaled);
+        if (floorVal == UINT64_MAX) {
+            return UINT64_MAX;
+        }
+        return floorVal + (scaled > static_cast<double>(floorVal) ? 1ULL : 0ULL);
     } else {
         if (d.count() <= static_cast<Rep>(0)) {
             return 0ULL;
+        }
+        if constexpr (PreciseSafeNanoRatio<Period>::overflows_tick) {
+            return UINT64_MAX;
         }
         if constexpr (sizeof(Rep) > sizeof(std::uint64_t)) {
             if (d.count() > static_cast<Rep>(UINT64_MAX)) {
@@ -159,27 +226,25 @@ constexpr std::uint64_t PreciseSafeDurationToNanos(const std::chrono::duration<R
             }
         }
         const std::uint64_t count = static_cast<std::uint64_t>(d.count());
-        using NanoRatio = std::ratio_divide<Period, std::nano>;
-        constexpr std::uintmax_t num = static_cast<std::uintmax_t>(NanoRatio::num);
-        constexpr std::uintmax_t den = static_cast<std::uintmax_t>(NanoRatio::den);
+        constexpr std::uint64_t num = PreciseSafeNanoRatio<Period>::num;
+        constexpr std::uint64_t den = PreciseSafeNanoRatio<Period>::den;
         if constexpr (num == den) {
             return count;
         } else if constexpr (den == 1) {
-            constexpr std::uint64_t kMaxCount = UINT64_MAX / static_cast<std::uint64_t>(num);
+            constexpr std::uint64_t kMaxCount = UINT64_MAX / num;
             if (count > kMaxCount) {
                 return UINT64_MAX;
             }
-            return count * static_cast<std::uint64_t>(num);
+            return count * num;
         } else {
-            const std::uint64_t q = count / static_cast<std::uint64_t>(den);
-            const std::uint64_t r = count % static_cast<std::uint64_t>(den);
-            constexpr std::uint64_t kMaxQ = UINT64_MAX / static_cast<std::uint64_t>(num);
+            const std::uint64_t q = count / den;
+            const std::uint64_t r = count % den;
+            constexpr std::uint64_t kMaxQ = UINT64_MAX / num;
             if (q > kMaxQ) {
                 return UINT64_MAX;
             }
-            const std::uint64_t base = q * static_cast<std::uint64_t>(num);
-            const std::uint64_t remTicks =
-                PreciseMulDivCeil64(r, static_cast<std::uint64_t>(num), static_cast<std::uint64_t>(den));
+            const std::uint64_t base = q * num;
+            const std::uint64_t remTicks = PreciseMulDivCeil64(r, num, den);
             if (UINT64_MAX - base < remTicks) {
                 return UINT64_MAX;
             }
