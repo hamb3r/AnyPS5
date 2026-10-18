@@ -1,6 +1,9 @@
 name: macOS Disassembly Analysis
 
 on:
+  push:
+    branches:
+      - 'exp/**'
   workflow_dispatch:
     inputs:
       commit_sha:
