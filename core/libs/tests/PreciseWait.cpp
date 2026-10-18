@@ -99,6 +99,9 @@ int main() {
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<INTMAX_MAX, 1>>(1)) == UINT64_MAX);
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<INTMAX_MAX, 1>>(0)) == 0ULL);
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<int64_t, std::ratio<INTMAX_MAX, 1>>(-5)) == 0ULL);
+    static_assert(PreciseSafeDurationToNanos(std::chrono::duration<double>(0.067)) == 67000000ULL);
+    static_assert(PreciseSafeDurationToNanos(std::chrono::duration<double>(1e-300)) == 1ULL);
+    static_assert(PreciseSafeDurationToNanos(std::chrono::duration<double, std::pico>(1001.0)) == 2ULL);
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<double, std::ratio<INTMAX_MAX, 1>>(1e-20)) == 92233721ULL);
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<double, std::ratio<INTMAX_MAX, 1>>(1.0)) == UINT64_MAX);
     static_assert(PreciseSafeDurationToNanos(std::chrono::duration<double, std::ratio<INTMAX_MAX, 1>>(-1.0)) == 0ULL);
@@ -175,6 +178,14 @@ int main() {
     }
     if (PreciseSafeDurationToNanos(std::chrono::duration<double, std::ratio<INTMAX_MAX, 1>>(1e-20)) != 92233721ULL) {
         std::cerr << "PreciseSafeDurationToNanos tiny double huge period check failed\n";
+        return 1;
+    }
+    if (PreciseSafeDurationToNanos(std::chrono::duration<double>(0.067)) != 67000000ULL) {
+        std::cerr << "PreciseSafeDurationToNanos 0.067 float check failed\n";
+        return 1;
+    }
+    if (PreciseSafeDurationToNanos(std::chrono::duration<double>(1e-300)) != 1ULL) {
+        std::cerr << "PreciseSafeDurationToNanos underflow check failed\n";
         return 1;
     }
 

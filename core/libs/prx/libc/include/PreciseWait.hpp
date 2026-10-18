@@ -208,11 +208,23 @@ constexpr std::uint64_t PreciseSafeDurationToNanos(const std::chrono::duration<R
         if (scaled > std::numeric_limits<double>::max() || scaled >= static_cast<double>(UINT64_MAX)) {
             return UINT64_MAX;
         }
+        if (scaled <= 1.0) {
+            return 1ULL;
+        }
         const std::uint64_t floorVal = static_cast<std::uint64_t>(scaled);
         if (floorVal == UINT64_MAX) {
             return UINT64_MAX;
         }
-        return floorVal + (scaled > static_cast<double>(floorVal) ? 1ULL : 0ULL);
+        const double epsTol = (scaled * std::numeric_limits<double>::epsilon() * 8.0 > 1e-9)
+                                  ? (scaled * std::numeric_limits<double>::epsilon() * 8.0)
+                                  : 1e-9;
+        if (scaled - static_cast<double>(floorVal) <= epsTol) {
+            return floorVal;
+        }
+        if (static_cast<double>(floorVal + 1ULL) - scaled <= epsTol) {
+            return floorVal + 1ULL;
+        }
+        return floorVal + 1ULL;
     } else {
         if (d.count() <= static_cast<Rep>(0)) {
             return 0ULL;
