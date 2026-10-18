@@ -231,7 +231,18 @@ jobs:
           fi
 
           echo "" >> "$REPORT_FILE"
-          echo "--- 3. 64-bit Fallback Symbol Audit ---" >> "$REPORT_FILE"
+          echo "--- 3. Final Production Binary Runtime Helper Audit ---" >> "$REPORT_FILE"
+          DIV_SYMS_BIN=$(nm -nm output/production/bench_macos | grep -E "__udivti3|__umodti3" || true)
+          if [ -n "$DIV_SYMS_BIN" ]; then
+            echo "FAIL: Found 128-bit division helpers in production/bench_macos:" >> "$REPORT_FILE"
+            echo "$DIV_SYMS_BIN" >> "$REPORT_FILE"
+            exit 1
+          else
+            echo "PASS: No __udivti3 / __umodti3 helpers found in production/bench_macos." >> "$REPORT_FILE"
+          fi
+
+          echo "" >> "$REPORT_FILE"
+          echo "--- 4. 64-bit Fallback Symbol Audit ---" >> "$REPORT_FILE"
           FALLBACK_SYMS=$(nm -nm output/production/precise_wait.o | grep -E "PreciseMulDivCeilFallback64|export_PreciseComputeMachDeadline64" || true)
           echo "$FALLBACK_SYMS" >> "$REPORT_FILE"
 

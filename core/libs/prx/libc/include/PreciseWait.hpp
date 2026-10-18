@@ -469,9 +469,9 @@ inline mach_timebase_info_data_t PreciseMachTimebase() {
 }
 
 inline bool PreciseAppleLowTimerSlack() {
-    static thread_local bool lowSlack = false;
-    if (lowSlack) [[likely]] {
-        return true;
+    static thread_local std::int8_t lowSlackState = 0;
+    if (lowSlackState != 0) [[likely]] {
+        return lowSlackState > 0;
     }
     const auto tb = PreciseMachTimebase();
     if (tb.numer == 0 || tb.denom == 0) {
@@ -486,6 +486,7 @@ inline bool PreciseAppleLowTimerSlack() {
     const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
 #endif
     if (periodTicks > UINT32_MAX || computationTicks > UINT32_MAX) {
+        lowSlackState = -1;
         return false;
     }
     policy.period = static_cast<uint32_t>(periodTicks);
@@ -500,8 +501,11 @@ inline bool PreciseAppleLowTimerSlack() {
         THREAD_TIME_CONSTRAINT_POLICY_COUNT);
     mach_port_deallocate(mach_task_self(), threadPort);
     if (kr == KERN_SUCCESS) {
-        lowSlack = true;
+        lowSlackState = 1;
         return true;
+    }
+    if (kr == KERN_NOT_SUPPORTED || kr == KERN_PROTECTION_FAILURE || kr == KERN_INVALID_ARGUMENT) {
+        lowSlackState = -1;
     }
     return false;
 }
