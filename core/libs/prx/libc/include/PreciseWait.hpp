@@ -314,8 +314,13 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
                 g_preciseWaitTraceSample.syscall_return_code = 0xFFFFFFFF;
                 return;
             }
-            const std::uint64_t sleepTicks = static_cast<std::uint64_t>(
-                (static_cast<unsigned __int128>(sleepNanos) * tb.denom) / tb.numer);
+            const unsigned __int128 sleepTicks128 =
+                (static_cast<unsigned __int128>(sleepNanos) * tb.denom) / tb.numer;
+            if (sleepTicks128 > UINT64_MAX) [[unlikely]] {
+                g_preciseWaitTraceSample.syscall_return_code = 0xFFFFFFFE;
+                return;
+            }
+            const std::uint64_t sleepTicks = static_cast<std::uint64_t>(sleepTicks128);
             g_preciseWaitTraceSample.req_sleep_nanos = sleepNanos;
             g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
             g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
