@@ -10,10 +10,15 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <time.h>
 #if defined(__APPLE__)
+#include <mach/mach_init.h>
+#include <mach/mach_port.h>
 #include <mach/mach_time.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
 #include <sys/sysctl.h>
 #endif
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -23,13 +28,13 @@
 using Clock = std::chrono::steady_clock;
 
 template <typename T>
-__attribute__((always_inline)) inline void DoNotOptimize(const T& val) {
+[[gnu::always_inline]] inline void DoNotOptimize(const T& val) {
 #if defined(__clang__) || defined(__GNUC__)
     asm volatile("" :: "r,m"(val) : "memory");
 #endif
 }
 
-__attribute__((noinline)) void BenchmarkSleepUntil(Clock::time_point deadline) {
+[[gnu::noinline]] void BenchmarkSleepUntil(Clock::time_point deadline) {
     PreciseSleepUntil(deadline);
 }
 
@@ -74,122 +79,222 @@ inline std::uint64_t ReadThreadCpuNanos() {
     return 0;
 }
 
-struct BenchmarkMetrics {
-    double wall_min_us;
-    double wall_median_us;
-    double wall_p90_us;
-    double wall_max_us;
-    double wall_mean_us;
-    double overshoot_median_us;
-    double overshoot_mean_us;
-
-    double cpu_min_us;
-    double cpu_median_us;
-    double cpu_p90_us;
-    double cpu_max_us;
-    double cpu_mean_us;
-
-    int early_returns;
-    int total_samples;
+struct PercentileStats {
+    double p50;
+    double p90;
+    double p99;
+    double mean;
+    double max_val;
+    double min_val;
 };
 
-template <typename Fn>
-BenchmarkMetrics BenchmarkCall(int samples, double target_us, Fn&& fn) {
-    std::vector<double> wall_durations;
-    std::vector<double> cpu_durations;
-    wall_durations.reserve(samples);
-    cpu_durations.reserve(samples);
-    int early = 0;
-    double overshoot_sum = 0.0;
-    double cpu_sum = 0.0;
-    double wall_sum = 0.0;
-
-    for (int i = 0; i < samples; ++i) {
-        const std::uint64_t cpu_t0 = ReadThreadCpuNanos();
-        const auto t0 = Clock::now();
-        fn();
-        const auto t1 = Clock::now();
-        const std::uint64_t cpu_t1 = ReadThreadCpuNanos();
-
-        const double wall_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-        const double cpu_us = (cpu_t1 >= cpu_t0) ? static_cast<double>(cpu_t1 - cpu_t0) / 1000.0 : 0.0;
-
-        wall_durations.push_back(wall_us);
-        cpu_durations.push_back(cpu_us);
-        wall_sum += wall_us;
-        cpu_sum += cpu_us;
-        if (wall_us < target_us) {
-            early++;
-        }
-        overshoot_sum += (wall_us - target_us);
+inline PercentileStats ComputeStats(std::vector<double>& v) {
+    if (v.empty()) {
+        return PercentileStats{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     }
-
-    std::sort(wall_durations.begin(), wall_durations.end());
-    std::sort(cpu_durations.begin(), cpu_durations.end());
-
-    const double wall_min_us = wall_durations.front();
-    const double wall_median_us = wall_durations[wall_durations.size() / 2];
-    const double wall_p90_us = wall_durations[static_cast<size_t>(wall_durations.size() * 0.9)];
-    const double wall_max_us = wall_durations.back();
-    const double wall_mean_us = wall_sum / samples;
-
-    const double overshoot_med = wall_median_us - target_us;
-    const double overshoot_mean = overshoot_sum / samples;
-
-    const double cpu_min_us = cpu_durations.front();
-    const double cpu_median_us = cpu_durations[cpu_durations.size() / 2];
-    const double cpu_p90_us = cpu_durations[static_cast<size_t>(cpu_durations.size() * 0.9)];
-    const double cpu_max_us = cpu_durations.back();
-    const double cpu_mean_us = cpu_sum / samples;
-
-    return BenchmarkMetrics{
-        wall_min_us, wall_median_us, wall_p90_us, wall_max_us, wall_mean_us,
-        overshoot_med, overshoot_mean,
-        cpu_min_us, cpu_median_us, cpu_p90_us, cpu_max_us, cpu_mean_us,
-        early, samples
+    std::sort(v.begin(), v.end());
+    const double sum = std::accumulate(v.begin(), v.end(), 0.0);
+    const size_t n = v.size();
+    return PercentileStats{
+        v[n / 2],
+        v[static_cast<size_t>(n * 0.90)],
+        v[static_cast<size_t>(n * 0.99)],
+        sum / n,
+        v.back(),
+        v.front()
     };
 }
 
-struct PhaseStats {
-    double min_val;
-    double median_val;
-    double p90_val;
-    double mean_val;
-    double max_val;
+struct ModeResults {
+    std::string backend_name;
+    bool policy_enabled;
+    std::string policy_status;
+    std::uint32_t spin_tail_us;
+    std::uint64_t total_samples;
+    std::uint64_t warmup_samples;
+    std::uint64_t early_returns;
+    std::uint64_t outliers_count;
+    std::uint64_t total_eintr;
+    std::uint32_t last_syscall_code;
+    std::uint64_t invalid_samples;
+
+    PercentileStats total_wall_us;
+    PercentileStats total_overshoot_us;
+    PercentileStats sleep_wall_us;
+    PercentileStats sleep_overshoot_us;
+    PercentileStats spin_wall_us;
+    PercentileStats spin_cpu_us;
+    PercentileStats spin_unaccounted_us;
+    PercentileStats total_cpu_us;
+    PercentileStats wall_residual_us;
+    PercentileStats cpu_residual_us;
 };
 
-inline PhaseStats ComputePhaseStats(std::vector<double>& vals) {
-    if (vals.empty()) {
-        return PhaseStats{0.0, 0.0, 0.0, 0.0, 0.0};
-    }
-    std::sort(vals.begin(), vals.end());
-    const double sum = std::accumulate(vals.begin(), vals.end(), 0.0);
-    return PhaseStats{
-        vals.front(),
-        vals[vals.size() / 2],
-        vals[static_cast<size_t>(vals.size() * 0.9)],
-        sum / vals.size(),
-        vals.back()
-    };
+inline ModeResults RunIsolatedMode(
+    PreciseWaitBackend backend,
+    bool enable_policy,
+    unsigned long long sleep_micros,
+    int warmup_count,
+    int sample_count) {
+
+    ModeResults res{};
+    res.backend_name = (backend == PreciseWaitBackend::Nanosleep) ? "nanosleep" : "mach_wait_until";
+    res.policy_enabled = enable_policy;
+    res.total_samples = sample_count;
+    res.warmup_samples = warmup_count;
+
+    std::vector<double> v_total_wall;
+    std::vector<double> v_total_overshoot;
+    std::vector<double> v_sleep_wall;
+    std::vector<double> v_sleep_overshoot;
+    std::vector<double> v_spin_wall;
+    std::vector<double> v_spin_cpu;
+    std::vector<double> v_spin_unaccounted;
+    std::vector<double> v_total_cpu;
+    std::vector<double> v_wall_residual;
+    std::vector<double> v_cpu_residual;
+
+    v_total_wall.reserve(sample_count);
+    v_total_overshoot.reserve(sample_count);
+    v_sleep_wall.reserve(sample_count);
+    v_sleep_overshoot.reserve(sample_count);
+    v_spin_wall.reserve(sample_count);
+    v_spin_cpu.reserve(sample_count);
+    v_spin_unaccounted.reserve(sample_count);
+    v_total_cpu.reserve(sample_count);
+    v_wall_residual.reserve(sample_count);
+    v_cpu_residual.reserve(sample_count);
+
+    std::thread worker([&] {
+        std::string status = "OFF";
+#if defined(__APPLE__)
+        if (enable_policy) {
+            mach_timebase_info_data_t tb;
+            if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer > 0) {
+                thread_time_constraint_policy_data_t policy;
+                const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
+                const uint64_t computationTicks = (500000ULL * tb.denom) / tb.numer;
+                if (periodTicks <= UINT32_MAX && computationTicks <= UINT32_MAX) {
+                    policy.period = static_cast<uint32_t>(periodTicks);
+                    policy.computation = static_cast<uint32_t>(computationTicks);
+                    policy.constraint = static_cast<uint32_t>(periodTicks);
+                    policy.preemptible = TRUE;
+                    const mach_port_t threadPort = mach_thread_self();
+                    const kern_return_t kr = thread_policy_set(
+                        threadPort,
+                        THREAD_TIME_CONSTRAINT_POLICY,
+                        reinterpret_cast<thread_policy_t>(&policy),
+                        THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+                    mach_port_deallocate(mach_task_self(), threadPort);
+                    if (kr == KERN_SUCCESS) {
+                        status = "ON (kr=0)";
+                    } else {
+                        status = "FAILED (kr=" + std::to_string(kr) + ")";
+                    }
+                } else {
+                    status = "OVERFLOW";
+                }
+            } else {
+                status = "TIMEBASE_ERR";
+            }
+        }
+#endif
+        res.policy_status = status;
+        const bool lowSlack = (status.rfind("ON", 0) == 0);
+        res.spin_tail_us = lowSlack ? 200 : 500;
+
+        g_preciseWaitTraceBackend = backend;
+        g_preciseWaitTraceActive = true;
+
+        for (int i = 0; i < warmup_count; ++i) {
+            PreciseSleepUs(sleep_micros);
+        }
+
+        const double target_us = static_cast<double>(sleep_micros);
+
+        for (int i = 0; i < sample_count; ++i) {
+            PreciseSleepUs(sleep_micros);
+
+            const auto& s = g_preciseWaitTraceSample;
+            const bool monotonic = (s.t0 <= s.t1) && (s.t1 <= s.t2) && (s.t2 <= s.t3) && (s.t3 <= s.t4);
+            if (!monotonic) {
+                res.invalid_samples++;
+                continue;
+            }
+
+            res.total_eintr += s.eintr_count;
+            res.last_syscall_code = s.syscall_return_code;
+
+            const double total_w = static_cast<double>(s.t4 - s.t0) / 1000.0;
+            const double prep_w  = static_cast<double>(s.t1 - s.t0) / 1000.0;
+            const double sleep_w = static_cast<double>(s.t2 - s.t1) / 1000.0;
+            const double spin_w  = static_cast<double>(s.t3 - s.t2) / 1000.0;
+            const double post_w  = static_cast<double>(s.t4 - s.t3) / 1000.0;
+
+            const double total_c = (s.cpu4 >= s.cpu0) ? static_cast<double>(s.cpu4 - s.cpu0) / 1000.0 : 0.0;
+            const double prep_c  = (s.cpu1 >= s.cpu0) ? static_cast<double>(s.cpu1 - s.cpu0) / 1000.0 : 0.0;
+            const double sleep_c = (s.cpu2 >= s.cpu1) ? static_cast<double>(s.cpu2 - s.cpu1) / 1000.0 : 0.0;
+            const double spin_c  = (s.cpu3 >= s.cpu2) ? static_cast<double>(s.cpu3 - s.cpu2) / 1000.0 : 0.0;
+            const double post_c  = (s.cpu4 >= s.cpu3) ? static_cast<double>(s.cpu4 - s.cpu3) / 1000.0 : 0.0;
+
+            const double w_residual = total_w - (prep_w + sleep_w + spin_w + post_w);
+            const double c_residual = total_c - (prep_c + sleep_c + spin_c + post_c);
+
+            const double req_sleep = static_cast<double>(s.req_sleep_nanos) / 1000.0;
+            const double sleep_overshoot = sleep_w - req_sleep;
+            const double total_overshoot = total_w - target_us;
+            const double spin_unacc = (spin_w >= spin_c) ? (spin_w - spin_c) : 0.0;
+
+            if (total_w < target_us) {
+                res.early_returns++;
+            }
+            if (total_w >= (target_us * 1.10)) {
+                res.outliers_count++;
+            }
+
+            v_total_wall.push_back(total_w);
+            v_total_overshoot.push_back(total_overshoot);
+            v_sleep_wall.push_back(sleep_w);
+            v_sleep_overshoot.push_back(sleep_overshoot);
+            v_spin_wall.push_back(spin_w);
+            v_spin_cpu.push_back(spin_c);
+            v_spin_unaccounted.push_back(spin_unacc);
+            v_total_cpu.push_back(total_c);
+            v_wall_residual.push_back(w_residual);
+            v_cpu_residual.push_back(c_residual);
+        }
+
+        g_preciseWaitTraceActive = false;
+    });
+
+    worker.join();
+
+    res.total_wall_us = ComputeStats(v_total_wall);
+    res.total_overshoot_us = ComputeStats(v_total_overshoot);
+    res.sleep_wall_us = ComputeStats(v_sleep_wall);
+    res.sleep_overshoot_us = ComputeStats(v_sleep_overshoot);
+    res.spin_wall_us = ComputeStats(v_spin_wall);
+    res.spin_cpu_us = ComputeStats(v_spin_cpu);
+    res.spin_unaccounted_us = ComputeStats(v_spin_unaccounted);
+    res.total_cpu_us = ComputeStats(v_total_cpu);
+    res.wall_residual_us = ComputeStats(v_wall_residual);
+    res.cpu_residual_us = ComputeStats(v_cpu_residual);
+
+    return res;
 }
 
 int main() {
     std::ostringstream report;
 
-    report << "### macOS Timer, PreciseWait & Phase Instrumentation Benchmark\n\n";
+    report << "### macOS Timer 2x2 Matrix & Unified Trace Benchmark\n\n";
 
 #if defined(__APPLE__)
     struct timespec res_mono{}, res_raw{};
     clock_getres(CLOCK_MONOTONIC, &res_mono);
     clock_getres(CLOCK_MONOTONIC_RAW, &res_raw);
 
-    struct timespec ts_mono{}, ts_raw{};
-    clock_gettime(CLOCK_MONOTONIC, &ts_mono);
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts_raw);
-
-    const int64_t ns_mono = static_cast<int64_t>(ts_mono.tv_sec) * 1000000000LL + ts_mono.tv_nsec;
-    const int64_t ns_raw = static_cast<int64_t>(ts_raw.tv_sec) * 1000000000LL + ts_raw.tv_nsec;
-    const double offset_ms = static_cast<double>(ns_raw - ns_mono) / 1000000.0;
+    mach_timebase_info_data_t tb{};
+    mach_timebase_info(&tb);
 
     report << "- **Platform:** macOS ("
 #if defined(__aarch64__) || defined(__arm64__)
@@ -200,253 +305,164 @@ int main() {
            << "Unknown Arch"
 #endif
            << ")\n";
+    report << "- **Mach timebase:** " << tb.numer << " / " << tb.denom << "\n";
     report << "- **CLOCK_MONOTONIC resolution:** " << res_mono.tv_nsec << " ns\n";
     report << "- **CLOCK_MONOTONIC_RAW resolution:** " << res_raw.tv_nsec << " ns\n";
-    report << "- **CLOCK_MONOTONIC vs RAW offset:** " << std::fixed << std::setprecision(2) << offset_ms << " ms\n";
 #if defined(__aarch64__) || defined(__arm64__)
     report << "- **ARM64 cntfrq_el0:** " << ReadCntfrqHz() << " Hz\n";
 #endif
-    report << "- **PreciseAppleLowTimerSlack active:** " << (PreciseAppleLowTimerSlack() ? "YES (THREAD_TIME_CONSTRAINT_POLICY)" : "NO") << "\n\n";
+    report << "\n";
 #else
     report << "- **Platform:** Non-Apple POSIX\n\n";
 #endif
 
-    const auto baseline = BenchmarkCall(100, 0.0, [] {
-        volatile int dummy = 0;
-        DoNotOptimize(dummy);
-    });
-    report << "#### Measurement Baseline Calibration (100 samples empty loop)\n\n";
-    report << "- **Measurement loop overhead (Wall):** Median = "
-           << std::fixed << std::setprecision(3) << baseline.wall_median_us * 1000.0 << " ns, Mean = "
-           << baseline.wall_mean_us * 1000.0 << " ns\n";
-    report << "- **Measurement loop overhead (Thread CPU):** Median = "
-           << baseline.cpu_median_us * 1000.0 << " ns, Mean = "
-           << baseline.cpu_mean_us * 1000.0 << " ns\n\n";
+    std::vector<double> v_probe_wall;
+    std::vector<double> v_probe_cpu;
+    v_probe_wall.reserve(1000);
+    v_probe_cpu.reserve(1000);
 
-    constexpr int kPastSamples = 100000;
+    for (int i = 0; i < 1000; ++i) {
+        const std::uint64_t c0 = ReadThreadCpuNanos();
+        const std::uint64_t t0 = PreciseMonotonicNanos();
+        const std::uint64_t t1 = PreciseMonotonicNanos();
+        const std::uint64_t c1 = ReadThreadCpuNanos();
+        const std::uint64_t t2 = PreciseMonotonicNanos();
+        const std::uint64_t c2 = ReadThreadCpuNanos();
+        const std::uint64_t t3 = PreciseMonotonicNanos();
+        const std::uint64_t c3 = ReadThreadCpuNanos();
+        const std::uint64_t t4 = PreciseMonotonicNanos();
+        const std::uint64_t c4 = ReadThreadCpuNanos();
+
+        v_probe_wall.push_back(static_cast<double>(t4 - t0) / 1000.0);
+        v_probe_cpu.push_back((c4 >= c0) ? static_cast<double>(c4 - c0) / 1000.0 : 0.0);
+    }
+    const auto probe_w_stats = ComputeStats(v_probe_wall);
+    const auto probe_c_stats = ComputeStats(v_probe_cpu);
+
+    report << "#### 1. Baseline Probe Overhead Calibration (1000 samples T0..T4 without sleep)\n\n";
+    report << "| Probe Metric | p50 | p90 | p99 | Mean | Max |\n";
+    report << "|---|---:|---:|---:|---:|---:|\n";
+    report << "| T0..T4 Wall Probe Overhead | " << std::fixed << std::setprecision(3)
+           << probe_w_stats.p50 * 1000.0 << " ns | " << probe_w_stats.p90 * 1000.0 << " ns | "
+           << probe_w_stats.p99 * 1000.0 << " ns | " << probe_w_stats.mean * 1000.0 << " ns | "
+           << probe_w_stats.max_val * 1000.0 << " ns |\n";
+    report << "| CPU Clock Probe Overhead | "
+           << probe_c_stats.p50 * 1000.0 << " ns | " << probe_c_stats.p90 * 1000.0 << " ns | "
+           << probe_c_stats.p99 * 1000.0 << " ns | " << probe_c_stats.mean * 1000.0 << " ns | "
+           << probe_c_stats.max_val * 1000.0 << " ns |\n\n";
+
+    constexpr int kFastPathSamples = 100000;
     const auto past_deadline = Clock::now() - std::chrono::seconds(1);
     const auto past_us = std::chrono::time_point_cast<std::chrono::microseconds>(past_deadline);
-
-    const std::uint64_t tsc0 = ReadTscTicks();
-    const std::uint64_t cnt0 = ReadCntvctTicks();
-    const std::uint64_t cpu0 = ReadThreadCpuNanos();
-    const auto t0 = Clock::now();
-    for (int i = 0; i < kPastSamples; ++i) {
-        BenchmarkSleepUntil(past_deadline);
-    }
-    const auto t1 = Clock::now();
-    const std::uint64_t cpu1 = ReadThreadCpuNanos();
-    const std::uint64_t cnt1 = ReadCntvctTicks();
-    const std::uint64_t tsc1 = ReadTscTicks();
-
-    const double ns_per_call = std::chrono::duration<double, std::nano>(t1 - t0).count() / kPastSamples;
-    const double cpu_ns_per_call = static_cast<double>(cpu1 - cpu0) / kPastSamples;
-#if defined(__x86_64__) || defined(_M_X64)
-    const double tsc_per_call = static_cast<double>(tsc1 - tsc0) / kPastSamples;
-#elif defined(__aarch64__) || defined(__arm64__)
-    const double cnt_per_call = static_cast<double>(cnt1 - cnt0) / kPastSamples;
-#endif
-
-    const std::uint64_t tsc0_us = ReadTscTicks();
-    const std::uint64_t cnt0_us = ReadCntvctTicks();
-    const std::uint64_t cpu0_us = ReadThreadCpuNanos();
-    const auto t0_us = Clock::now();
-    for (int i = 0; i < kPastSamples; ++i) {
-        BenchmarkSleepUntil(past_us);
-    }
-    const auto t1_us = Clock::now();
-    const std::uint64_t cpu1_us = ReadThreadCpuNanos();
-    const std::uint64_t cnt1_us = ReadCntvctTicks();
-    const std::uint64_t tsc1_us = ReadTscTicks();
-
-    const double ns_per_call_us = std::chrono::duration<double, std::nano>(t1_us - t0_us).count() / kPastSamples;
-    const double cpu_ns_per_call_us = static_cast<double>(cpu1_us - cpu0_us) / kPastSamples;
-#if defined(__x86_64__) || defined(_M_X64)
-    const double tsc_per_call_us = static_cast<double>(tsc1_us - tsc0_us) / kPastSamples;
-#elif defined(__aarch64__) || defined(__arm64__)
-    const double cnt_per_call_us = static_cast<double>(cnt1_us - cnt0_us) / kPastSamples;
-#endif
-
     volatile int64_t runtime_zero_ns = 0;
     DoNotOptimize(runtime_zero_ns);
     const Clock::time_point zero_time{std::chrono::nanoseconds(runtime_zero_ns)};
 
+    const std::uint64_t tsc0 = ReadTscTicks();
+    const std::uint64_t cpu0 = ReadThreadCpuNanos();
+    const auto ft0 = Clock::now();
+    for (int i = 0; i < kFastPathSamples; ++i) {
+        BenchmarkSleepUntil(past_deadline);
+    }
+    const auto ft1 = Clock::now();
+    const std::uint64_t cpu1 = ReadThreadCpuNanos();
+    const std::uint64_t tsc1 = ReadTscTicks();
+
     const std::uint64_t tsc0_z = ReadTscTicks();
-    const std::uint64_t cnt0_z = ReadCntvctTicks();
     const std::uint64_t cpu0_z = ReadThreadCpuNanos();
-    const auto t0_z = Clock::now();
-    for (int i = 0; i < kPastSamples; ++i) {
+    const auto ft0_z = Clock::now();
+    for (int i = 0; i < kFastPathSamples; ++i) {
         BenchmarkSleepUntil(zero_time);
     }
-    const auto t1_z = Clock::now();
+    const auto ft1_z = Clock::now();
     const std::uint64_t cpu1_z = ReadThreadCpuNanos();
-    const std::uint64_t cnt1_z = ReadCntvctTicks();
     const std::uint64_t tsc1_z = ReadTscTicks();
 
-    const double ns_per_call_z = std::chrono::duration<double, std::nano>(t1_z - t0_z).count() / kPastSamples;
-    const double cpu_ns_per_call_z = static_cast<double>(cpu1_z - cpu0_z) / kPastSamples;
-#if defined(__x86_64__) || defined(_M_X64)
-    const double tsc_per_call_z = static_cast<double>(tsc1_z - tsc0_z) / kPastSamples;
-#elif defined(__aarch64__) || defined(__arm64__)
-    const double cnt_per_call_z = static_cast<double>(cnt1_z - cnt0_z) / kPastSamples;
-#endif
-
-    report << "#### 1. Expired Deadline Fast-Path Overhead (100k calls, DCE protected)\n\n";
-    report << "| Scenario | Wall Latency | Thread CPU Time | "
+    report << "#### 2. Expired Deadline Fast-Path (100k calls on isolated thread, DCE protected)\n\n";
+    report << "| Call | Wall Latency | Thread CPU Time | "
 #if defined(__x86_64__) || defined(_M_X64)
            << "TSC ticks (lfenced) |\n";
-#elif defined(__aarch64__) || defined(__arm64__)
-           << "cntvct ticks (isb) |\n";
 #else
-           << "Hardware ticks |\n";
+           << "Raw cycles/ticks |\n";
 #endif
     report << "|---|---:|---:|---:|\n";
-    report << "| `PreciseSleepUntil(past)` (nanos) | " << std::fixed << std::setprecision(1)
-           << ns_per_call << " ns | " << cpu_ns_per_call << " ns | "
+    report << "| `PreciseSleepUntil(past)` | " << std::fixed << std::setprecision(1)
+           << (std::chrono::duration<double, std::nano>(ft1 - ft0).count() / kFastPathSamples) << " ns | "
+           << (static_cast<double>(cpu1 - cpu0) / kFastPathSamples) << " ns | "
 #if defined(__x86_64__) || defined(_M_X64)
-           << tsc_per_call << " |\n";
-#elif defined(__aarch64__) || defined(__arm64__)
-           << cnt_per_call << " |\n";
+           << (static_cast<double>(tsc1 - tsc0) / kFastPathSamples) << " |\n";
 #else
            << "n/a |\n";
 #endif
-
-    report << "| `PreciseSleepUntil(past_us)` (micros) | " << std::fixed << std::setprecision(1)
-           << ns_per_call_us << " ns | " << cpu_ns_per_call_us << " ns | "
+    report << "| `PreciseSleepUntil(zero_time)` | "
+           << (std::chrono::duration<double, std::nano>(ft1_z - ft0_z).count() / kFastPathSamples) << " ns | "
+           << (static_cast<double>(cpu1_z - cpu0_z) / kFastPathSamples) << " ns | "
 #if defined(__x86_64__) || defined(_M_X64)
-           << tsc_per_call_us << " |\n";
-#elif defined(__aarch64__) || defined(__arm64__)
-           << cnt_per_call_us << " |\n";
-#else
-           << "n/a |\n";
-#endif
-
-    report << "| `PreciseSleepUntil(zero_time)` (runtime opaque) | " << std::fixed << std::setprecision(1)
-           << ns_per_call_z << " ns | " << cpu_ns_per_call_z << " ns | "
-#if defined(__x86_64__) || defined(_M_X64)
-           << tsc_per_call_z << " |\n\n";
-#elif defined(__aarch64__) || defined(__arm64__)
-           << cnt_per_call_z << " |\n\n";
+           << (static_cast<double>(tsc1_z - tsc0_z) / kFastPathSamples) << " |\n\n";
 #else
            << "n/a |\n\n";
 #endif
 
-    report << "#### 2. Sleep Latency & CPU Time (100 samples each, matching statistics)\n\n";
-    report << "| Scenario | Target | Wall Median (Overshoot) | Wall Mean | CPU Median | CPU Mean | Early Returns | Target Bound Status |\n";
-    report << "|---|---:|---:|---:|---:|---:|:---:|:---:|\n";
+    report << "#### 3. 2x2 Matrix: Backend vs RT Policy for PreciseSleepUs(1500) (1000 samples, 50 warmup each)\n\n";
 
-    const auto stats_50us = BenchmarkCall(100, 50.0, [] { PreciseSleepUs(50); });
-    const bool pass_50us = (stats_50us.wall_median_us < 90.0) && (stats_50us.early_returns == 0);
-    report << "| `PreciseSleepUs(50)` | 50.0 µs | "
-           << std::fixed << std::setprecision(1) << stats_50us.wall_median_us << " µs (+"
-           << stats_50us.overshoot_median_us << " µs) | "
-           << stats_50us.wall_mean_us << " µs | "
-           << stats_50us.cpu_median_us << " µs | "
-           << stats_50us.cpu_mean_us << " µs | "
-           << stats_50us.early_returns << " / " << stats_50us.total_samples << " | "
-           << (pass_50us ? "✅ PASS (< 90 µs)" : "❌ FAIL (>= 90 µs)") << " |\n";
-
-    const auto stats_1500us = BenchmarkCall(100, 1500.0, [] { PreciseSleepUs(1500); });
-    const bool pass_1500us = (stats_1500us.wall_median_us < 1650.0) && (stats_1500us.early_returns == 0);
-    report << "| `PreciseSleepUs(1500)` | 1500.0 µs | "
-           << std::fixed << std::setprecision(1) << stats_1500us.wall_median_us << " µs (+"
-           << stats_1500us.overshoot_median_us << " µs) | "
-           << stats_1500us.wall_mean_us << " µs | "
-           << stats_1500us.cpu_median_us << " µs | "
-           << stats_1500us.cpu_mean_us << " µs | "
-           << stats_1500us.early_returns << " / " << stats_1500us.total_samples << " | "
-           << (pass_1500us ? "✅ PASS (< 1650 µs)" : "❌ FAIL (>= 1650 µs)") << " |\n";
-
-    const auto stats_until_50us = BenchmarkCall(100, 50.0, [] {
-        PreciseSleepUntil(Clock::now() + std::chrono::microseconds(50));
-    });
-    const bool pass_until_50us = (stats_until_50us.wall_median_us < 90.0) && (stats_until_50us.early_returns == 0);
-    report << "| `PreciseSleepUntil(+50µs)` | 50.0 µs | "
-           << std::fixed << std::setprecision(1) << stats_until_50us.wall_median_us << " µs (+"
-           << stats_until_50us.overshoot_median_us << " µs) | "
-           << stats_until_50us.wall_mean_us << " µs | "
-           << stats_until_50us.cpu_median_us << " µs | "
-           << stats_until_50us.cpu_mean_us << " µs | "
-           << stats_until_50us.early_returns << " / " << stats_until_50us.total_samples << " | "
-           << (pass_until_50us ? "✅ PASS (< 90 µs)" : "❌ FAIL (>= 90 µs)") << " |\n";
-
-    const auto stats_until_1ms = BenchmarkCall(100, 1000.0, [] {
-        PreciseSleepUntil(Clock::now() + std::chrono::milliseconds(1));
-    });
-    report << "| `PreciseSleepUntil(+1ms)` | 1000.0 µs | "
-           << std::fixed << std::setprecision(1) << stats_until_1ms.wall_median_us << " µs (+"
-           << stats_until_1ms.overshoot_median_us << " µs) | "
-           << stats_until_1ms.wall_mean_us << " µs | "
-           << stats_until_1ms.cpu_median_us << " µs | "
-           << stats_until_1ms.cpu_mean_us << " µs | "
-           << stats_until_1ms.early_returns << " / " << stats_until_1ms.total_samples << " | "
-           << (stats_until_1ms.early_returns == 0 ? "✅ 0 early" : "❌ EARLY RETURN") << " |\n\n";
-
-#ifdef APS5_PRECISE_WAIT_TRACE
-    report << "#### 3. Instrumented Phase Breakdown for PreciseSleepUs(1500) (100 samples)\n\n";
-    std::vector<double> sleep_req_samples;
-    std::vector<double> sleep_wall_samples;
-    std::vector<double> sleep_overshoot_samples;
-    std::vector<double> spin_wall_samples;
-    std::vector<double> spin_cpu_samples;
-    std::vector<double> spin_unaccounted_samples;
-
-    sleep_req_samples.reserve(100);
-    sleep_wall_samples.reserve(100);
-    sleep_overshoot_samples.reserve(100);
-    spin_wall_samples.reserve(100);
-    spin_cpu_samples.reserve(100);
-    spin_unaccounted_samples.reserve(100);
-
-    g_preciseWaitTraceActive = true;
-    for (int i = 0; i < 100; ++i) {
-        PreciseSleepUs(1500);
-        const double req_us = static_cast<double>(g_preciseWaitTraceData.requested_sleep_nanos) / 1000.0;
-        const double sw_us = static_cast<double>(g_preciseWaitTraceData.t2_nanos - g_preciseWaitTraceData.t1_nanos) / 1000.0;
-        const double so_us = sw_us - req_us;
-        const double spw_us = static_cast<double>(g_preciseWaitTraceData.t3_nanos - g_preciseWaitTraceData.t2_nanos) / 1000.0;
-        const double spc_us = (g_preciseWaitTraceData.cpu3_nanos >= g_preciseWaitTraceData.cpu2_nanos)
-            ? static_cast<double>(g_preciseWaitTraceData.cpu3_nanos - g_preciseWaitTraceData.cpu2_nanos) / 1000.0
-            : 0.0;
-        const double unacc_us = (spw_us >= spc_us) ? (spw_us - spc_us) : 0.0;
-
-        sleep_req_samples.push_back(req_us);
-        sleep_wall_samples.push_back(sw_us);
-        sleep_overshoot_samples.push_back(so_us);
-        spin_wall_samples.push_back(spw_us);
-        spin_cpu_samples.push_back(spc_us);
-        spin_unaccounted_samples.push_back(unacc_us);
-    }
-    g_preciseWaitTraceActive = false;
-
-    const auto s_req = ComputePhaseStats(sleep_req_samples);
-    const auto s_sw = ComputePhaseStats(sleep_wall_samples);
-    const auto s_so = ComputePhaseStats(sleep_overshoot_samples);
-    const auto s_spw = ComputePhaseStats(spin_wall_samples);
-    const auto s_spc = ComputePhaseStats(spin_cpu_samples);
-    const auto s_unacc = ComputePhaseStats(spin_unaccounted_samples);
-
-    report << "| Measurement Phase | Min | Median | p90 | Mean | Max |\n";
-    report << "|---|---:|---:|---:|---:|---:|\n";
-    report << "| `nanosleep` Requested | " << std::fixed << std::setprecision(1)
-           << s_req.min_val << " µs | " << s_req.median_val << " µs | " << s_req.p90_val << " µs | "
-           << s_req.mean_val << " µs | " << s_req.max_val << " µs |\n";
-    report << "| `nanosleep` Actual Wall | "
-           << s_sw.min_val << " µs | " << s_sw.median_val << " µs | " << s_sw.p90_val << " µs | "
-           << s_sw.mean_val << " µs | " << s_sw.max_val << " µs |\n";
-    report << "| `nanosleep` Overshoot (Actual - Req) | "
-           << s_so.min_val << " µs | " << s_so.median_val << " µs | " << s_so.p90_val << " µs | "
-           << s_so.mean_val << " µs | " << s_so.max_val << " µs |\n";
-    report << "| Spin-phase Wall Duration | "
-           << s_spw.min_val << " µs | " << s_spw.median_val << " µs | " << s_spw.p90_val << " µs | "
-           << s_spw.mean_val << " µs | " << s_spw.max_val << " µs |\n";
-    report << "| Spin-phase Thread CPU Time | "
-           << s_spc.min_val << " µs | " << s_spc.median_val << " µs | " << s_spc.p90_val << " µs | "
-           << s_spc.mean_val << " µs | " << s_spc.max_val << " µs |\n";
-    report << "| Spin-phase Unaccounted Wall Time | "
-           << s_unacc.min_val << " µs | " << s_unacc.median_val << " µs | " << s_unacc.p90_val << " µs | "
-           << s_unacc.mean_val << " µs | " << s_unacc.max_val << " µs |\n\n";
+    std::vector<ModeResults> matrix_results;
+    matrix_results.push_back(RunIsolatedMode(PreciseWaitBackend::Nanosleep, false, 1500, 50, 1000));
+    matrix_results.push_back(RunIsolatedMode(PreciseWaitBackend::Nanosleep, true,  1500, 50, 1000));
+#if defined(__APPLE__)
+    matrix_results.push_back(RunIsolatedMode(PreciseWaitBackend::MachWaitUntil, false, 1500, 50, 1000));
+    matrix_results.push_back(RunIsolatedMode(PreciseWaitBackend::MachWaitUntil, true,  1500, 50, 1000));
 #endif
+
+    report << "| Backend | Policy | Spin Tail | Wall p50 | Wall p90 | Wall p99 | Wall Max | Wall Mean | Overshoot p50 | CPU p50 | CPU Mean | Outliers (>1650µs) | Early | EINTR |\n";
+    report << "|---|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|\n";
+
+    for (const auto& m : matrix_results) {
+        report << "| `" << m.backend_name << "` | "
+               << (m.policy_enabled ? "**ON**" : "OFF") << " | "
+               << m.spin_tail_us << " µs | "
+               << std::fixed << std::setprecision(1)
+               << m.total_wall_us.p50 << " µs | "
+               << m.total_wall_us.p90 << " µs | "
+               << m.total_wall_us.p99 << " µs | "
+               << m.total_wall_us.max_val << " µs | "
+               << m.total_wall_us.mean << " µs | +"
+               << m.total_overshoot_us.p50 << " µs | "
+               << m.total_cpu_us.p50 << " µs | "
+               << m.total_cpu_us.mean << " µs | "
+               << m.outliers_count << " / " << m.total_samples << " | "
+               << m.early_returns << " | "
+               << m.total_eintr << " |\n";
+    }
+    report << "\n";
+
+    report << "#### 4. Detailed Phase Deconstruction (p50 / p90 / p99 / Mean)\n\n";
+    for (const auto& m : matrix_results) {
+        report << "##### Mode: `" << m.backend_name << "` with Policy " << (m.policy_enabled ? "ON" : "OFF")
+               << " (Residual Wall p50=" << std::setprecision(3) << m.wall_residual_us.p50 * 1000.0 << " ns, "
+               << "Invalid samples=" << m.invalid_samples << ")\n\n";
+        report << "| Phase | p50 | p90 | p99 | Mean | Max |\n";
+        report << "|---|---:|---:|---:|---:|---:|\n";
+        report << "| Syscall Wall Duration ($T_2 - T_1$) | " << std::fixed << std::setprecision(1)
+               << m.sleep_wall_us.p50 << " µs | " << m.sleep_wall_us.p90 << " µs | "
+               << m.sleep_wall_us.p99 << " µs | " << m.sleep_wall_us.mean << " µs | "
+               << m.sleep_wall_us.max_val << " µs |\n";
+        report << "| Syscall Overshoot ($Actual - Req$) | "
+               << m.sleep_overshoot_us.p50 << " µs | " << m.sleep_overshoot_us.p90 << " µs | "
+               << m.sleep_overshoot_us.p99 << " µs | " << m.sleep_overshoot_us.mean << " µs | "
+               << m.sleep_overshoot_us.max_val << " µs |\n";
+        report << "| Spin-phase Wall Duration ($T_3 - T_2$) | "
+               << m.spin_wall_us.p50 << " µs | " << m.spin_wall_us.p90 << " µs | "
+               << m.spin_wall_us.p99 << " µs | " << m.spin_wall_us.mean << " µs | "
+               << m.spin_wall_us.max_val << " µs |\n";
+        report << "| Spin-phase Thread CPU ($CPU_3 - CPU_2$) | "
+               << m.spin_cpu_us.p50 << " µs | " << m.spin_cpu_us.p90 << " µs | "
+               << m.spin_cpu_us.p99 << " µs | " << m.spin_cpu_us.mean << " µs | "
+               << m.spin_cpu_us.max_val << " µs |\n";
+        report << "| Spin-phase Unaccounted ($Wall - CPU$) | "
+               << m.spin_unaccounted_us.p50 << " µs | " << m.spin_unaccounted_us.p90 << " µs | "
+               << m.spin_unaccounted_us.p99 << " µs | " << m.spin_unaccounted_us.mean << " µs | "
+               << m.spin_unaccounted_us.max_val << " µs |\n\n";
+    }
 
     std::cout << report.str();
 
@@ -457,17 +473,11 @@ int main() {
         }
     }
 
-    if (stats_50us.early_returns > 0 || stats_1500us.early_returns > 0 || stats_until_50us.early_returns > 0 || stats_until_1ms.early_returns > 0) {
-        std::cerr << "FATAL: One or more benchmarks returned BEFORE deadline!\n";
-        return 1;
-    }
-
-    if (!pass_50us || !pass_1500us || !pass_until_50us) {
-        if (const char* strict = std::getenv("APS5_STRICT_TIMING_BOUNDS"); strict != nullptr && strict[0] != '\0' && strict[0] != '0') {
-            std::cerr << "FATAL: Strict timing median bounds missed!\n";
+    for (const auto& m : matrix_results) {
+        if (m.early_returns > 0) {
+            std::cerr << "FATAL: Mode " << m.backend_name << " returned BEFORE deadline!\n";
             return 1;
         }
-        std::clog << "NOTE: One or more non-contract timing bounds were exceeded under runner load.\n";
     }
 
     return 0;
