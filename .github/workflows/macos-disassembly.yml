@@ -320,7 +320,10 @@ jobs:
           cmake --build build-macos --target \
             core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
             core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
+            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
             core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
+            core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
+            core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o \
             2>&1 | tee output/metadata/inline_remarks.txt
 
       - name: Level 2 - Analyze Production Call Site Objects (.o)
@@ -332,7 +335,10 @@ jobs:
           for obj in \
             build-macos/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
             build-macos/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
-            build-macos/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o; do
+            build-macos/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
+            build-macos/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
+            build-macos/core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
+            build-macos/core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o; do
             test -f "$obj"
             base=$(basename "$obj")
             cp "$obj" "$OBJ_DIR/$base"
@@ -370,13 +376,19 @@ jobs:
           cmake --build build-macos-diag --target \
             core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
             core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
-            core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o
+            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
+            core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
+            core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
+            core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o
 
           DIAG_DIR="output/level3_diagnostic_prx"
           for obj in \
             build-macos-diag/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
             build-macos-diag/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
-            build-macos-diag/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o; do
+            build-macos-diag/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
+            build-macos-diag/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
+            build-macos-diag/core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
+            build-macos-diag/core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o; do
             test -f "$obj"
             name=$(basename "$obj")
             xcrun llvm-objdump --macho --disassemble --demangle --source "$obj" > "$DIAG_DIR/${name}.source_asm.txt"
