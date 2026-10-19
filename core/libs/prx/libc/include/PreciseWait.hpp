@@ -788,6 +788,25 @@ inline void PreciseSleepUs(unsigned long long micros) {
     if (micros > UINT64_MAX / 1000ULL) [[unlikely]] {
         micros = UINT64_MAX / 1000ULL;
     }
+#if defined(__APPLE__) && !defined(APS5_PRECISE_WAIT_TRACE)
+    if (micros <= 200ULL) {
+        const std::uint64_t startNanos = PreciseMonotonicNanos();
+        const std::uint64_t nanos = micros * 1000ULL;
+        const std::uint64_t deadlineNanos =
+            nanos > UINT64_MAX - startNanos ? UINT64_MAX : startNanos + nanos;
+        (void)PreciseAppleLowTimerSlack();
+        for (;;) {
+            const std::uint64_t nowNanos = PreciseMonotonicNanos();
+            if (nowNanos >= deadlineNanos) {
+                break;
+            }
+            if (deadlineNanos - nowNanos > 200ULL) {
+                PreciseSpinPause();
+            }
+        }
+        return;
+    }
+#endif
     PreciseSleepNanos(micros * 1000ULL);
     return;
 #else
