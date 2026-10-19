@@ -324,6 +324,7 @@ jobs:
             core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
             core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
             core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o \
+            -- -k 0 \
             2>&1 | tee output/metadata/inline_remarks.txt
 
       - name: Level 2 - Analyze Production Call Site Objects (.o)
@@ -339,7 +340,10 @@ jobs:
             build-macos/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
             build-macos/core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
             build-macos/core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o; do
-            test -f "$obj"
+            if [ ! -f "$obj" ]; then
+              echo "Missing production call-site object: $obj" >&2
+              exit 1
+            fi
             base=$(basename "$obj")
             cp "$obj" "$OBJ_DIR/$base"
             xcrun llvm-objdump --macho --disassemble --demangle "$obj" > "$CALL_DIR/${base}.asm.txt"
@@ -379,7 +383,8 @@ jobs:
             core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
             core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
             core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
-            core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o
+            core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o \
+            -- -k 0 || true
 
           DIAG_DIR="output/level3_diagnostic_prx"
           for obj in \
@@ -389,7 +394,10 @@ jobs:
             build-macos-diag/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
             build-macos-diag/core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
             build-macos-diag/core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o; do
-            test -f "$obj"
+            if [ ! -f "$obj" ]; then
+              echo "Missing diagnostic call-site object: $obj" >&2
+              exit 1
+            fi
             name=$(basename "$obj")
             xcrun llvm-objdump --macho --disassemble --demangle --source "$obj" > "$DIAG_DIR/${name}.source_asm.txt"
           done
