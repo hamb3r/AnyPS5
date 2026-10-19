@@ -319,6 +319,7 @@ jobs:
           echo "=== Building Selected Production Call-Site Objects with Clang Inline Remarks ==="
           python3 - <<'PY' 2>&1 | tee output/metadata/inline_remarks.txt
           import json
+          import os
           import shlex
           import subprocess
 
@@ -341,20 +342,24 @@ jobs:
           missing = wanted - selected.keys()
           if missing:
               raise SystemExit("Missing compile commands: " + ", ".join(sorted(missing)))
-          for path in sorted(wanted):
-              entry = selected[path]
-              print("=== " + path + " ===", flush=True)
-              result = subprocess.run(
-                  shlex.split(entry["command"]),
-                  cwd=entry["directory"],
-                  check=False,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  text=True,
-              )
-              print(result.stdout, end="", flush=True)
-              if result.returncode:
-                  raise SystemExit(result.returncode)
+          with open("output/metadata/production_call_site_objects.txt", "w", encoding="utf-8") as manifest:
+              for path in sorted(wanted):
+                  entry = selected[path]
+                  args = shlex.split(entry["command"])
+                  object_path = os.path.normpath(os.path.join(entry["directory"], args[args.index("-o") + 1]))
+                  print("=== " + path + " ===", flush=True)
+                  result = subprocess.run(
+                      args,
+                      cwd=entry["directory"],
+                      check=False,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                  )
+                  print(result.stdout, end="", flush=True)
+                  if result.returncode:
+                      raise SystemExit(result.returncode)
+                  print(object_path, file=manifest, flush=True)
           PY
 
       - name: Level 2 - Analyze Production Call Site Objects (.o)
@@ -363,13 +368,7 @@ jobs:
           CALL_DIR="output/call_sites"
 
           echo "=== Collecting and Disassembling Selected Call-Site Objects ==="
-          for obj in \
-            build-macos/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
-            build-macos/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
-            build-macos/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
-            build-macos/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
-            build-macos/core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
-            build-macos/core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o; do
+          while IFS= read -r obj; do
             if [ ! -f "$obj" ]; then
               echo "Missing production call-site object: $obj" >&2
               exit 1
@@ -378,7 +377,7 @@ jobs:
             cp "$obj" "$OBJ_DIR/$base"
             xcrun llvm-objdump --macho --disassemble --demangle "$obj" > "$CALL_DIR/${base}.asm.txt"
             nm -nm "$obj" > "$CALL_DIR/${base}.symbols.txt"
-          done
+          done < output/metadata/production_call_site_objects.txt
 
       - name: Level 3 - Disassemble and Analyze Built Production .prx
         run: |
@@ -409,6 +408,7 @@ jobs:
           echo "=== Building Diagnostic Call-Site Objects ==="
           python3 - <<'PY'
           import json
+          import os
           import shlex
           import subprocess
 
@@ -431,37 +431,35 @@ jobs:
           missing = wanted - selected.keys()
           if missing:
               raise SystemExit("Missing diagnostic compile commands: " + ", ".join(sorted(missing)))
-          for path in sorted(wanted):
-              entry = selected[path]
-              print("=== " + path + " ===", flush=True)
-              result = subprocess.run(
-                  shlex.split(entry["command"]),
-                  cwd=entry["directory"],
-                  check=False,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  text=True,
-              )
-              print(result.stdout, end="", flush=True)
-              if result.returncode:
-                  raise SystemExit(result.returncode)
+          with open("output/metadata/diagnostic_call_site_objects.txt", "w", encoding="utf-8") as manifest:
+              for path in sorted(wanted):
+                  entry = selected[path]
+                  args = shlex.split(entry["command"])
+                  object_path = os.path.normpath(os.path.join(entry["directory"], args[args.index("-o") + 1]))
+                  print("=== " + path + " ===", flush=True)
+                  result = subprocess.run(
+                      args,
+                      cwd=entry["directory"],
+                      check=False,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                  )
+                  print(result.stdout, end="", flush=True)
+                  if result.returncode:
+                      raise SystemExit(result.returncode)
+                  print(object_path, file=manifest, flush=True)
           PY
 
           DIAG_DIR="output/level3_diagnostic_prx"
-          for obj in \
-            build-macos-diag/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
-            build-macos-diag/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
-            build-macos-diag/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
-            build-macos-diag/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
-            build-macos-diag/core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
-            build-macos-diag/core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o; do
+          while IFS= read -r obj; do
             if [ ! -f "$obj" ]; then
               echo "Missing diagnostic call-site object: $obj" >&2
               exit 1
             fi
             name=$(basename "$obj")
             xcrun llvm-objdump --macho --disassemble --demangle --source "$obj" > "$DIAG_DIR/${name}.source_asm.txt"
-          done
+          done < output/metadata/diagnostic_call_site_objects.txt
 
       - name: Verify Production Artifacts and Call Sites
         run: |
