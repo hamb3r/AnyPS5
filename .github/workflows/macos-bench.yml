@@ -8,27 +8,37 @@ on:
 
 jobs:
   benchmark:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15-intel]
+        include:
+          - os: macos-15-intel
+            name: "Intel Mac (native x86_64)"
+            use_rosetta: false
+          - os: macos-latest
+            name: "Apple Silicon (Rosetta 2 x86_64)"
+            use_rosetta: true
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Compile and Run Benchmark
+      - name: Install Rosetta 2
+        if: matrix.use_rosetta
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Compile and Run Benchmark (x86_64)
         run: |
-          echo "=== Compiling bench_macos_timer ==="
-          clang++ -std=c++20 -O3 -DNDEBUG -DAPS5_PRECISE_WAIT_TRACE=1 -Icore/libs tools/bench_macos_timer.cpp -o bench_macos
-          echo "=== Running bench_macos_timer ==="
+          echo "=== Compiling bench_macos_timer (x86_64) ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -DAPS5_PRECISE_WAIT_TRACE=1 -Icore/libs tools/bench_macos_timer.cpp -o bench_macos
+          echo "=== Running bench_macos_timer (x86_64) ==="
           ./bench_macos
 
-      - name: Compile and Run PreciseWait Unit Tests
+      - name: Compile and Run PreciseWait Unit Tests (x86_64)
         run: |
-          echo "=== Compiling PreciseWait Unit Tests ==="
-          clang++ -std=c++20 -O3 -DNDEBUG -Icore/libs core/libs/tests/PreciseWait.cpp -o precise_wait_tests
+          echo "=== Compiling PreciseWait Unit Tests (x86_64) ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -Icore/libs core/libs/tests/PreciseWait.cpp -o precise_wait_tests
           echo "=== Running PreciseWait Unit Tests (APS5_SKIP_TIMING_TESTS=1) ==="
           APS5_SKIP_TIMING_TESTS=1 ./precise_wait_tests
           echo "Unit tests passed with 0 early returns."

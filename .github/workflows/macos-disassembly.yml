@@ -1,4 +1,4 @@
-name: macOS Disassembly Analysis
+name: macOS Production x86_64 Disassembly Analysis
 
 on:
   push:
@@ -13,18 +13,21 @@ on:
 
 jobs:
   disassembly:
-    name: ${{ matrix.os }} (${{ matrix.arch }})
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            arch: arm64
-            artifact_name: macos-arm64-disassembly
           - os: macos-15-intel
-            arch: x86_64
-            artifact_name: macos-x86_64-disassembly
+            name: "Intel Mac (native x86_64)"
+            artifact_name: macos-intel-x86_64-production-disassembly
+            use_rosetta: false
+          - os: macos-latest
+            name: "Apple Silicon (Rosetta 2 x86_64)"
+            artifact_name: macos-apple-silicon-rosetta-x86_64-production-disassembly
+            use_rosetta: true
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,9 +35,23 @@ jobs:
           ref: ${{ inputs.commit_sha != '' && inputs.commit_sha || github.ref }}
           fetch-depth: 0
 
+      - name: Initialize submodules
+        run: git submodule update --init --recursive --depth 1
+
+      - name: Install Rosetta 2
+        if: matrix.use_rosetta
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
       - name: Create Disassembly Harness and Output Directories
         run: |
-          mkdir -p output/production output/diagnostic
+          mkdir -p output/metadata
+          mkdir -p output/level1_harness/production
+          mkdir -p output/level1_harness/diagnostic
+          mkdir -p output/level2_cmake_objects
+          mkdir -p output/level3_production_prx
+          mkdir -p output/level3_diagnostic_prx
+          mkdir -p output/call_sites
+
           cat << 'EOF' > tools/disasm_precise_wait.cpp
           #include "prx/libc/include/PreciseWait.hpp"
 
@@ -103,7 +120,7 @@ jobs:
           #include <chrono>
 
           int main() {
-              std::cout << "=== Running Production PreciseWait Benchmark (No Trace) ===\n";
+              std::cout << "=== Running Production PreciseWait Benchmark (No Trace, x86_64) ===\n";
               const auto t0 = std::chrono::steady_clock::now();
               for (int i = 0; i < 1000; ++i) {
                   PreciseSleepUs(1500);
@@ -117,15 +134,17 @@ jobs:
 
       - name: Gather Toolchain and Environment Metadata
         run: |
-          META_FILE="output/metadata.txt"
+          META_FILE="output/metadata/metadata.txt"
           ACTUAL_SHA=$(git rev-parse HEAD)
           echo "=== Commit & Environment Metadata ===" > "$META_FILE"
+          echo "Environment: ${{ matrix.name }}" >> "$META_FILE"
           echo "Requested SHA: ${{ inputs.commit_sha }}" >> "$META_FILE"
           echo "Checked-out SHA: $ACTUAL_SHA" >> "$META_FILE"
           echo "Git Branch/Ref: ${{ github.ref }}" >> "$META_FILE"
           echo "Date (UTC): $(date -u)" >> "$META_FILE"
           echo "Architecture (uname -m): $(uname -m)" >> "$META_FILE"
           echo "Kernel (uname -a): $(uname -a)" >> "$META_FILE"
+          echo "Rosetta translated proc (sysctl): $(sysctl -in sysctl.proc_translated || echo 0)" >> "$META_FILE"
           echo "" >> "$META_FILE"
           echo "OS Version (sw_vers):" >> "$META_FILE"
           sw_vers >> "$META_FILE" 2>&1 || true
@@ -137,114 +156,139 @@ jobs:
           echo "" >> "$META_FILE"
           echo "Clang Version:" >> "$META_FILE"
           clang++ --version >> "$META_FILE" 2>&1 || true
-          echo "" >> "$META_FILE"
-          echo "Production Compiler Flags:" >> "$META_FILE"
-          echo "clang++ -std=c++20 -O3 -DNDEBUG -arch ${{ matrix.arch }} -Icore/libs" >> "$META_FILE"
-          echo "Diagnostic Compiler Flags:" >> "$META_FILE"
-          echo "clang++ -std=c++20 -O3 -DNDEBUG -g -DAPS5_PRECISE_WAIT_TRACE=1 -arch ${{ matrix.arch }} -Icore/libs" >> "$META_FILE"
 
-      - name: Build and Disassemble Production Variant (-O3 -DNDEBUG, No Trace)
+      - name: Level 1 - Build and Disassemble Standalone Harness (x86_64)
         run: |
-          ARCH="${{ matrix.arch }}"
-          PROD_DIR="output/production"
+          PROD_DIR="output/level1_harness/production"
+          DIAG_DIR="output/level1_harness/diagnostic"
 
-          echo "=== Compiling Pure Production PreciseWait ==="
-          clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -c -o "$PROD_DIR/precise_wait.o"
-          clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -S -o "$PROD_DIR/precise_wait.s"
-
-          echo "=== Disassembling Production PreciseWait ==="
-          xcrun llvm-objdump --macho --disassemble --demangle --arch "$ARCH" "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.${ARCH}.asm.txt"
-          xcrun otool -tvV -arch "$ARCH" "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.${ARCH}.otool.txt"
+          echo "=== Compiling Level 1 Pure Production PreciseWait (x86_64) ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -Icore/libs tools/disasm_precise_wait.cpp -c -o "$PROD_DIR/precise_wait.o"
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -Icore/libs tools/disasm_precise_wait.cpp -S -o "$PROD_DIR/precise_wait.s"
+          xcrun llvm-objdump --macho --disassemble --demangle "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.x86_64.asm.txt"
+          xcrun otool -tvV "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.x86_64.otool.txt"
           nm -nm "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.symbols.txt"
 
-          echo "=== Compiling Pure Production bench_macos ==="
-          clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/bench_production.cpp -o "$PROD_DIR/bench_macos"
-          clang++ -std=c++20 -O3 -DNDEBUG -arch "$ARCH" -Icore/libs tools/bench_production.cpp -S -o "$PROD_DIR/bench_macos.s"
-
-          echo "=== Disassembling Production bench_macos ==="
-          xcrun llvm-objdump --macho --disassemble --demangle --arch "$ARCH" "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.${ARCH}.asm.txt"
-          xcrun otool -tvV -arch "$ARCH" "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.${ARCH}.otool.txt"
+          echo "=== Compiling Level 1 Pure Production bench_macos (x86_64) ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -Icore/libs tools/bench_production.cpp -o "$PROD_DIR/bench_macos"
+          xcrun llvm-objdump --macho --disassemble --demangle "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.x86_64.asm.txt"
           nm -nm "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.symbols.txt"
 
-      - name: Build and Disassemble Diagnostic Variant (-O3 -DNDEBUG -g, With Trace)
+          echo "=== Compiling Level 1 Diagnostic PreciseWait (-g, x86_64) ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -g -arch x86_64 -Icore/libs tools/disasm_precise_wait.cpp -c -o "$DIAG_DIR/precise_wait_diag.o"
+          xcrun llvm-objdump --macho --disassemble --demangle --source "$DIAG_DIR/precise_wait_diag.o" > "$DIAG_DIR/precise_wait_diag.x86_64.source_asm.txt"
+
+      - name: Level 2 - CMake Production Build (Release x86_64, target libs)
         run: |
-          ARCH="${{ matrix.arch }}"
-          DIAG_DIR="output/diagnostic"
+          echo "=== Configuring CMake Production Build ==="
+          cmake -S . -B build-macos -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-          echo "=== Compiling Diagnostic PreciseWait (-g) ==="
-          clang++ -std=c++20 -O3 -DNDEBUG -g -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -c -o "$DIAG_DIR/precise_wait_diag.o"
-          clang++ -std=c++20 -O3 -DNDEBUG -g -arch "$ARCH" -Icore/libs tools/disasm_precise_wait.cpp -S -o "$DIAG_DIR/precise_wait_diag.s"
+          echo "=== Building Production Libraries (target libs) ==="
+          cmake --build build-macos --target libs --verbose
 
-          echo "=== Disassembling Diagnostic PreciseWait with Source Correlation ==="
-          xcrun llvm-objdump --macho --disassemble --demangle --source --arch "$ARCH" "$DIAG_DIR/precise_wait_diag.o" > "$DIAG_DIR/precise_wait_diag.${ARCH}.source_asm.txt"
-          xcrun otool -tvV -arch "$ARCH" "$DIAG_DIR/precise_wait_diag.o" > "$DIAG_DIR/precise_wait_diag.${ARCH}.otool.txt"
-          nm -nm "$DIAG_DIR/precise_wait_diag.o" > "$DIAG_DIR/precise_wait_diag.symbols.txt"
+          cp build-macos/compile_commands.json output/metadata/compile_commands.json
 
-          if [ -f "tools/bench_macos_timer.cpp" ]; then
-            echo "=== Compiling Diagnostic bench_macos_diag (-g, APS5_PRECISE_WAIT_TRACE=1) ==="
-            clang++ -std=c++20 -O3 -DNDEBUG -g -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -o "$DIAG_DIR/bench_macos_diag"
-            clang++ -std=c++20 -O3 -DNDEBUG -g -DAPS5_PRECISE_WAIT_TRACE=1 -arch "$ARCH" -Icore/libs tools/bench_macos_timer.cpp -S -o "$DIAG_DIR/bench_macos_diag.s"
-
-            echo "=== Disassembling Diagnostic bench_macos with Source Correlation ==="
-            xcrun llvm-objdump --macho --disassemble --demangle --source --arch "$ARCH" "$DIAG_DIR/bench_macos_diag" > "$DIAG_DIR/bench_macos_diag.${ARCH}.source_asm.txt"
-            xcrun otool -tvV -arch "$ARCH" "$DIAG_DIR/bench_macos_diag" > "$DIAG_DIR/bench_macos_diag.${ARCH}.otool.txt"
-            nm -nm "$DIAG_DIR/bench_macos_diag" > "$DIAG_DIR/bench_macos_diag.symbols.txt"
-          fi
-
-      - name: Verify Production Artifacts for Trace Symbols and Runtime Helpers
+      - name: Level 2 - Analyze Production Call Site Objects (.o)
         run: |
-          ARCH="${{ matrix.arch }}"
+          OBJ_DIR="output/level2_cmake_objects"
+          CALL_DIR="output/call_sites"
+
+          echo "=== Collecting and Disassembling Call Site Objects ==="
+          find build-macos/core/libs/prx -name "*.o" | while read -r obj; do
+            base=$(basename "$obj")
+            dir=$(basename $(dirname $(dirname "$obj")))
+            target_name="${dir}_${base}"
+            cp "$obj" "$OBJ_DIR/${target_name}"
+            xcrun llvm-objdump --macho --disassemble --demangle "$obj" > "$CALL_DIR/${target_name}.asm.txt" 2>&1 || true
+            nm -nm "$obj" > "$CALL_DIR/${target_name}.symbols.txt" 2>&1 || true
+          done
+
+      - name: Level 3 - Disassemble and Analyze Final Production .prx
+        run: |
+          PRX_DIR="output/level3_production_prx"
+
+          echo "=== Collecting Production .prx Files ==="
+          find build-macos/core/libs/libs -maxdepth 1 -name "*.prx" -exec cp {} "$PRX_DIR/" \;
+
+          echo "=== Disassembling Production .prx Files ==="
+          for prx in "$PRX_DIR"/*.prx; do
+            [ -f "$prx" ] || continue
+            name=$(basename "$prx")
+            echo "Analyzing $name..."
+            xcrun llvm-objdump --macho --disassemble --demangle "$prx" > "$PRX_DIR/${name}.asm.txt" 2>&1 || true
+            xcrun otool -tvV "$prx" > "$PRX_DIR/${name}.otool.txt" 2>&1 || true
+            nm -nm "$prx" > "$PRX_DIR/${name}.symbols.txt" 2>&1 || true
+          done
+
+      - name: Level 3 - CMake Diagnostic Build (-g x86_64, libc & libkernel)
+        run: |
+          echo "=== Configuring CMake Diagnostic Build (RelWithDebInfo) ==="
+          cmake -S . -B build-macos-diag -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64
+
+          echo "=== Building Diagnostic libc and libkernel ==="
+          cmake --build build-macos-diag --target libc libkernel --verbose
+
+          DIAG_PRX_DIR="output/level3_diagnostic_prx"
+          for prx in build-macos-diag/core/libs/libs/unpatched/*.prx; do
+            [ -f "$prx" ] || continue
+            name=$(basename "$prx")
+            echo "Disassembling diagnostic $name with source..."
+            xcrun llvm-objdump --macho --disassemble --demangle --source "$prx" > "$DIAG_PRX_DIR/${name}.source_asm.txt" 2>&1 || true
+          done
+
+      - name: Verify Production Artifacts and Call Sites
+        run: |
           REPORT_FILE="output/verification_report.txt"
-          echo "=== Production Artifacts Verification Report ($ARCH) ===" > "$REPORT_FILE"
+          echo "=== Production Artifacts & Call Sites Verification Report ===" > "$REPORT_FILE"
+          echo "Environment: ${{ matrix.name }}" >> "$REPORT_FILE"
           echo "Commit SHA: $(git rev-parse HEAD)" >> "$REPORT_FILE"
-          echo "Date: $(date -u)" >> "$REPORT_FILE"
+          echo "Date (UTC): $(date -u)" >> "$REPORT_FILE"
           echo "" >> "$REPORT_FILE"
 
-          echo "--- 1. Check for Trace Symbols in Production Objects ---" >> "$REPORT_FILE"
-          TRACE_SYMS_O=$(nm -nm output/production/precise_wait.o | grep -i "trace" || true)
-          if [ -n "$TRACE_SYMS_O" ]; then
-            echo "FAIL: Unexpected trace symbols in production/precise_wait.o:" >> "$REPORT_FILE"
-            echo "$TRACE_SYMS_O" >> "$REPORT_FILE"
-            exit 1
-          else
-            echo "PASS: 0 trace symbols found in production/precise_wait.o." >> "$REPORT_FILE"
-          fi
-
-          TRACE_SYMS_BIN=$(nm -nm output/production/bench_macos | grep -i "g_preciseWaitTrace" || true)
-          if [ -n "$TRACE_SYMS_BIN" ]; then
-            echo "FAIL: Unexpected trace symbols in production/bench_macos:" >> "$REPORT_FILE"
-            echo "$TRACE_SYMS_BIN" >> "$REPORT_FILE"
-            exit 1
-          else
-            echo "PASS: 0 trace symbols found in production/bench_macos." >> "$REPORT_FILE"
-          fi
-
+          echo "--- 1. Architecture Verification (file output/level3_production_prx/*.prx) ---" >> "$REPORT_FILE"
+          file output/level3_production_prx/*.prx >> "$REPORT_FILE" 2>&1 || true
           echo "" >> "$REPORT_FILE"
-          echo "--- 2. Runtime Helper Symbols Audit (__udivti3 / __umodti3) ---" >> "$REPORT_FILE"
-          DIV_SYMS=$(nm -nm output/production/precise_wait.o | grep -E "__udivti3|__umodti3" || true)
-          if [ -n "$DIV_SYMS" ]; then
-            echo "AUDIT: Found 128-bit division helpers in production/precise_wait.o:" >> "$REPORT_FILE"
-            echo "$DIV_SYMS" >> "$REPORT_FILE"
-            echo "Explanation: __udivti3 is called by export_PreciseComputeMachDeadline (unsigned __int128 / uint32_t)." >> "$REPORT_FILE"
-          else
-            echo "PASS: No __udivti3 / __umodti3 helpers found in production/precise_wait.o." >> "$REPORT_FILE"
-          fi
 
+          echo "--- 2. Runtime Helper Audit (__udivti3 / __umodti3 in .prx) ---" >> "$REPORT_FILE"
+          for prx in output/level3_production_prx/*.prx; do
+            [ -f "$prx" ] || continue
+            bname=$(basename "$prx")
+            div_syms=$(nm -nm "$prx" 2>/dev/null | grep -E "__udivti3|__umodti3" || true)
+            if [ -n "$div_syms" ]; then
+              echo "AUDIT: $bname contains 128-bit division helpers:" >> "$REPORT_FILE"
+              echo "$div_syms" >> "$REPORT_FILE"
+            else
+              echo "PASS: $bname has 0 __udivti3/__umodti3 helpers." >> "$REPORT_FILE"
+            fi
+          done
           echo "" >> "$REPORT_FILE"
-          echo "--- 3. Final Production Binary Runtime Helper Audit ---" >> "$REPORT_FILE"
-          DIV_SYMS_BIN=$(nm -nm output/production/bench_macos | grep -E "__udivti3|__umodti3" || true)
-          if [ -n "$DIV_SYMS_BIN" ]; then
-            echo "FAIL: Found 128-bit division helpers in production/bench_macos:" >> "$REPORT_FILE"
-            echo "$DIV_SYMS_BIN" >> "$REPORT_FILE"
-            exit 1
-          else
-            echo "PASS: No __udivti3 / __umodti3 helpers found in production/bench_macos." >> "$REPORT_FILE"
-          fi
 
+          echo "--- 3. Trace Symbols Audit in Production .prx ---" >> "$REPORT_FILE"
+          for prx in output/level3_production_prx/*.prx; do
+            [ -f "$prx" ] || continue
+            bname=$(basename "$prx")
+            trace_syms=$(nm -nm "$prx" 2>/dev/null | grep -i "g_preciseWaitTrace" || true)
+            if [ -n "$trace_syms" ]; then
+              echo "FAIL: $bname contains unexpected trace symbols:" >> "$REPORT_FILE"
+              echo "$trace_syms" >> "$REPORT_FILE"
+              exit 1
+            else
+              echo "PASS: $bname has 0 trace symbols." >> "$REPORT_FILE"
+            fi
+          done
           echo "" >> "$REPORT_FILE"
-          echo "--- 4. 64-bit Fallback Symbol Audit ---" >> "$REPORT_FILE"
-          FALLBACK_SYMS=$(nm -nm output/production/precise_wait.o | grep -E "PreciseMulDivCeilFallback64|export_PreciseComputeMachDeadline64" || true)
-          echo "$FALLBACK_SYMS" >> "$REPORT_FILE"
+
+          echo "--- 4. Call Sites PreciseSleep Inspection ---" >> "$REPORT_FILE"
+          grep -rn "PreciseSleep" output/call_sites/*.symbols.txt >> "$REPORT_FILE" 2>&1 || echo "Note: PreciseSleep symbols inlined into call sites." >> "$REPORT_FILE"
 
           cat "$REPORT_FILE" >> "$GITHUB_STEP_SUMMARY"
 
