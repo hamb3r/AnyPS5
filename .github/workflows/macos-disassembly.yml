@@ -327,7 +327,6 @@ jobs:
           wanted = {
               "core/libs/prx/libkernel/Apr/src/Apr.cpp",
               "core/libs/prx/libkernel/Aio/src/Aio.cpp",
-              "core/libs/prx/libkernel/Socket/src/Udp.cpp",
               "core/libs/prx/libSceFont/src/State.cpp",
               "core/libs/prx/libSceVideoOut/src/VideoOutDriver.cpp",
               "core/libs/prx/libSceAudioOut/src/AudioOut.cpp",
@@ -363,7 +362,7 @@ jobs:
                       raise SystemExit(result.returncode)
                   print(object_path, file=manifest, flush=True)
           PY
-          test "$(wc -l < output/metadata/production_call_site_objects.txt | tr -d ' ')" -eq 6
+          test "$(wc -l < output/metadata/production_call_site_objects.txt | tr -d ' ')" -eq 5
 
       - name: Level 2 - Analyze Production Call Site Objects (.o)
         run: |
@@ -486,7 +485,7 @@ jobs:
           echo "--- 2. Built Production Call Site Objects (.o) ---" >> "$REPORT_FILE"
           ls -lh output/level2_cmake_objects >> "$REPORT_FILE"
           echo "Production call-site object count: $(wc -l < output/metadata/production_call_site_objects.txt | tr -d ' ')" >> "$REPORT_FILE"
-          echo "Diagnostic source mapping excludes Udp.cpp because macOS SDK lacks ppoll and POLLRDHUP." >> "$REPORT_FILE"
+          echo "Production and diagnostic object sets exclude Udp.cpp because its Darwin build references unavailable ppoll and POLLRDHUP." >> "$REPORT_FILE"
           echo "Diagnostic call-site object count: $(wc -l < output/metadata/diagnostic_call_site_objects.txt | tr -d ' ')" >> "$REPORT_FILE"
           echo "" >> "$REPORT_FILE"
 
