@@ -774,6 +774,9 @@ inline void PreciseSleepNanos(unsigned long long nanos) {
 
 inline constexpr unsigned long long kSubTickWaitUs = 2000;
 
+#if defined(__APPLE__) && !defined(APS5_PRECISE_WAIT_TRACE)
+[[gnu::always_inline]]
+#endif
 inline void PreciseSleepUs(unsigned long long micros) {
     if (micros == 0) {
         return;
