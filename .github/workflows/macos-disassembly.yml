@@ -317,15 +317,45 @@ jobs:
           cp build-macos/compile_commands.json output/metadata/compile_commands.json
 
           echo "=== Building Selected Production Call-Site Objects with Clang Inline Remarks ==="
-          cmake --build build-macos --target \
-            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
-            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
-            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
-            core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
-            core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
-            core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o \
-            -- -k 0 \
-            2>&1 | tee output/metadata/inline_remarks.txt
+          python3 - <<'PY' 2>&1 | tee output/metadata/inline_remarks.txt
+          import json
+          import shlex
+          import subprocess
+
+          wanted = {
+              "core/libs/prx/libkernel/Apr/src/Apr.cpp",
+              "core/libs/prx/libkernel/Aio/src/Aio.cpp",
+              "core/libs/prx/libkernel/Socket/src/Udp.cpp",
+              "core/libs/prx/libSceFont/src/State.cpp",
+              "core/libs/prx/libSceVideoOut/src/VideoOutDriver.cpp",
+              "core/libs/prx/libSceAudioOut/src/AudioOut.cpp",
+          }
+          with open("build-macos/compile_commands.json", encoding="utf-8") as source:
+              commands = json.load(source)
+          selected = {}
+          for entry in commands:
+              source = entry["file"].replace("\\", "/")
+              for path in wanted:
+                  if source.endswith("/" + path):
+                      selected[path] = entry
+          missing = wanted - selected.keys()
+          if missing:
+              raise SystemExit("Missing compile commands: " + ", ".join(sorted(missing)))
+          for path in sorted(wanted):
+              entry = selected[path]
+              print("=== " + path + " ===", flush=True)
+              result = subprocess.run(
+                  shlex.split(entry["command"]),
+                  cwd=entry["directory"],
+                  check=False,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              print(result.stdout, end="", flush=True)
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          PY
 
       - name: Level 2 - Analyze Production Call Site Objects (.o)
         run: |
@@ -376,15 +406,46 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_OSX_ARCHITECTURES=x86_64
 
-          echo "=== Building Diagnostic Targets with Ninja ==="
-          cmake --build build-macos-diag --target \
-            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
-            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
-            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
-            core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
-            core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
-            core/libs/prx/libSceAudioOut/CMakeFiles/libSceAudioOut.dir/src/AudioOut.cpp.o \
-            -- -k 0 || true
+          echo "=== Building Diagnostic Call-Site Objects ==="
+          python3 - <<'PY'
+          import json
+          import shlex
+          import subprocess
+
+          wanted = {
+              "core/libs/prx/libkernel/Apr/src/Apr.cpp",
+              "core/libs/prx/libkernel/Aio/src/Aio.cpp",
+              "core/libs/prx/libkernel/Socket/src/Udp.cpp",
+              "core/libs/prx/libSceFont/src/State.cpp",
+              "core/libs/prx/libSceVideoOut/src/VideoOutDriver.cpp",
+              "core/libs/prx/libSceAudioOut/src/AudioOut.cpp",
+          }
+          with open("build-macos-diag/compile_commands.json", encoding="utf-8") as source:
+              commands = json.load(source)
+          selected = {}
+          for entry in commands:
+              source = entry["file"].replace("\\", "/")
+              for path in wanted:
+                  if source.endswith("/" + path):
+                      selected[path] = entry
+          missing = wanted - selected.keys()
+          if missing:
+              raise SystemExit("Missing diagnostic compile commands: " + ", ".join(sorted(missing)))
+          for path in sorted(wanted):
+              entry = selected[path]
+              print("=== " + path + " ===", flush=True)
+              result = subprocess.run(
+                  shlex.split(entry["command"]),
+                  cwd=entry["directory"],
+                  check=False,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              print(result.stdout, end="", flush=True)
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          PY
 
           DIAG_DIR="output/level3_diagnostic_prx"
           for obj in \
