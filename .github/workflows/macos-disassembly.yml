@@ -147,27 +147,43 @@ jobs:
               std::uint64_t earlyReturns = 0;
               wallUs.reserve(sampleCount);
               cpuUs.reserve(sampleCount);
-              std::thread worker([&] {
-                  for (int i = 0; i < warmupCount; ++i) {
-                      PreciseSleepUs(sleepUs);
-                  }
-                  for (int i = 0; i < sampleCount; ++i) {
-                      const std::uint64_t wall0 = ReadNanos(CLOCK_MONOTONIC_RAW);
-                      const std::uint64_t cpu0 = ReadNanos(CLOCK_THREAD_CPUTIME_ID);
-                      PreciseSleepUs(sleepUs);
-                      const std::uint64_t cpu1 = ReadNanos(CLOCK_THREAD_CPUTIME_ID);
-                      const std::uint64_t wall1 = ReadNanos(CLOCK_MONOTONIC_RAW);
-                      if (wall1 < wall0 || cpu1 < cpu0) {
-                          std::abort();
+              {
+                  std::thread worker([&] {
+                      for (int i = 0; i < warmupCount; ++i) {
+                          PreciseSleepUs(sleepUs);
                       }
-                      if (wall1 - wall0 < sleepUs * 1000ULL) {
-                          ++earlyReturns;
+                      for (int i = 0; i < sampleCount; ++i) {
+                          const std::uint64_t wall0 = ReadNanos(CLOCK_MONOTONIC_RAW);
+                          PreciseSleepUs(sleepUs);
+                          const std::uint64_t wall1 = ReadNanos(CLOCK_MONOTONIC_RAW);
+                          if (wall1 < wall0) {
+                              std::abort();
+                          }
+                          if (wall1 - wall0 < sleepUs * 1000ULL) {
+                              ++earlyReturns;
+                          }
+                          wallUs.push_back(static_cast<double>(wall1 - wall0) / 1000.0);
                       }
-                      wallUs.push_back(static_cast<double>(wall1 - wall0) / 1000.0);
-                      cpuUs.push_back(static_cast<double>(cpu1 - cpu0) / 1000.0);
-                  }
-              });
-              worker.join();
+                  });
+                  worker.join();
+              }
+              {
+                  std::thread worker([&] {
+                      for (int i = 0; i < warmupCount; ++i) {
+                          PreciseSleepUs(sleepUs);
+                      }
+                      for (int i = 0; i < sampleCount; ++i) {
+                          const std::uint64_t cpu0 = ReadNanos(CLOCK_THREAD_CPUTIME_ID);
+                          PreciseSleepUs(sleepUs);
+                          const std::uint64_t cpu1 = ReadNanos(CLOCK_THREAD_CPUTIME_ID);
+                          if (cpu1 < cpu0) {
+                              std::abort();
+                          }
+                          cpuUs.push_back(static_cast<double>(cpu1 - cpu0) / 1000.0);
+                      }
+                  });
+                  worker.join();
+              }
               std::sort(wallUs.begin(), wallUs.end());
               std::sort(cpuUs.begin(), cpuUs.end());
               const double wallMean = std::accumulate(wallUs.begin(), wallUs.end(), 0.0) / sampleCount;
