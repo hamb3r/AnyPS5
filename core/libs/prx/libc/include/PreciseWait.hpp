@@ -740,20 +740,14 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
         }
     } else {
 #endif
-#if defined(__APPLE__) && !defined(APS5_PRECISE_WAIT_TRACE)
-    std::uint64_t nowNanos =
-        nanos <= spinTailNanos && deadlineNanos > startNanos ? startNanos : PreciseMonotonicNanos();
-#else
-    std::uint64_t nowNanos = PreciseMonotonicNanos();
-#endif
     for (;;) {
+        const std::uint64_t nowNanos = PreciseMonotonicNanos();
         if (nowNanos >= deadlineNanos) {
             break;
         }
         if (deadlineNanos - nowNanos > 200ULL) {
             PreciseSpinPause();
         }
-        nowNanos = PreciseMonotonicNanos();
     }
 #if defined(__APPLE__) && defined(APS5_PRECISE_WAIT_TRACE)
     }
