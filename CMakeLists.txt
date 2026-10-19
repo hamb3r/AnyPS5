@@ -81,6 +81,10 @@ if(APPLE AND NOT ANYPS5_RELINKER_ONLY)
     add_link_options(-fexperimental-library)
 endif()
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-return-type-c-linkage>)
+endif()
+
 if(BUILD_TESTING)
     add_test_executable(shader_cache_file_read_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/CacheFileReadTests.cpp)
