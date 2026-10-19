@@ -798,15 +798,14 @@ inline void PreciseSleepUs(unsigned long long micros) {
         const std::uint64_t deadlineNanos =
             nanos > UINT64_MAX - startNanos ? UINT64_MAX : startNanos + nanos;
         (void)PreciseAppleLowTimerSlack();
-        std::uint64_t nowNanos = startNanos;
         for (;;) {
+            const std::uint64_t nowNanos = PreciseMonotonicNanos();
             if (nowNanos >= deadlineNanos) {
                 break;
             }
             if (deadlineNanos - nowNanos > 200ULL) {
                 PreciseSpinPause();
             }
-            nowNanos = PreciseMonotonicNanos();
         }
         return;
     }
