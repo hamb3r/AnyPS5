@@ -1,0 +1,21 @@
+name: Check QPC Frequency
+
+on:
+  push:
+    branches:
+      - test/check-arm-qpc
+  workflow_dispatch:
+
+jobs:
+  check-arm:
+    runs-on: windows-11-arm
+    steps:
+      - name: System info and QPC frequency
+        shell: pwsh
+        run: |
+          Write-Host "=== QPC Frequency ==="
+          [System.Diagnostics.Stopwatch]::Frequency
+          Write-Host "=== Processor Info ==="
+          Get-CimInstance Win32_Processor | Select-Object Name, Architecture, MaxClockSpeed | Format-List
+          Write-Host "=== OS Architecture ==="
+          $env:PROCESSOR_ARCHITECTURE
