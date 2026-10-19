@@ -379,6 +379,9 @@ inline void PreciseSpinPause() {
 }
 
 inline std::uint64_t PreciseMonotonicNanos() {
+#if defined(__APPLE__) && defined(CLOCK_MONOTONIC_RAW)
+    return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+#else
     struct timespec ts;
 #if defined(__APPLE__) && defined(_LIBCPP_VERSION) && defined(CLOCK_MONOTONIC_RAW)
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
@@ -386,6 +389,7 @@ inline std::uint64_t PreciseMonotonicNanos() {
     clock_gettime(CLOCK_MONOTONIC, &ts);
 #endif
     return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(ts.tv_nsec);
+#endif
 }
 
 #ifdef APS5_PRECISE_WAIT_TRACE

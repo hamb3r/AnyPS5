@@ -427,7 +427,7 @@ jobs:
           cat output/short_wait_ab/results.csv >> "$REPORT_FILE"
           echo "" >> "$REPORT_FILE"
           echo "--- 6. Baseline vs Candidate Constant and Dynamic Call-Site Disassembly ---" >> "$REPORT_FILE"
-          grep -nE 'export_PreciseSleepUs_(10|30|50|dynamic)|PreciseSleepFromNanosWithSlack|_clock_gettime|_nanosleep' output/level1_harness/baseline/short_wait_probe.x86_64.asm.txt output/level1_harness/production/short_wait_probe.x86_64.asm.txt >> "$REPORT_FILE" || true
+          grep -nE 'export_PreciseSleepUs_(10|30|50|dynamic)|PreciseSleepFromNanosWithSlack|_clock_gettime(_nsec_np)?|_nanosleep' output/level1_harness/baseline/short_wait_probe.x86_64.asm.txt output/level1_harness/production/short_wait_probe.x86_64.asm.txt >> "$REPORT_FILE" || true
 
           cat "$REPORT_FILE" >> "$GITHUB_STEP_SUMMARY"
 
