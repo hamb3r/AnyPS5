@@ -10,6 +10,10 @@ on:
         description: 'Commit SHA to checkout (empty for caller ref)'
         required: false
         default: ''
+      baseline_sha:
+        description: 'Baseline commit for short-wait A/B (empty for previous commit)'
+        required: false
+        default: ''
 
 jobs:
   disassembly:
@@ -116,19 +120,85 @@ jobs:
 
           cat << 'EOF' > tools/bench_production.cpp
           #include "prx/libc/include/PreciseWait.hpp"
+          #include <algorithm>
+          #include <cstdlib>
+          #include <cstdint>
           #include <iostream>
-          #include <chrono>
+          #include <iomanip>
+          #include <numeric>
+          #include <string>
+          #include <thread>
+          #include <vector>
+          #include <time.h>
 
-          int main() {
-              std::cout << "=== Running Production PreciseWait Benchmark (No Trace, x86_64) ===\n";
-              const auto t0 = std::chrono::steady_clock::now();
-              for (int i = 0; i < 1000; ++i) {
-                  PreciseSleepUs(1500);
+          static std::uint64_t ReadNanos(clockid_t clockId) {
+              struct timespec ts{};
+              if (clock_gettime(clockId, &ts) != 0) {
+                  std::abort();
               }
-              const auto t1 = std::chrono::steady_clock::now();
-              const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-              std::cout << "1000 x PreciseSleepUs(1500): " << ms << " ms total\n";
+              return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(ts.tv_nsec);
+          }
+
+          static void Run(const std::string& variant, const std::string& round, unsigned long long sleepUs) {
+              constexpr int warmupCount = 50;
+              constexpr int sampleCount = 3000;
+              std::vector<double> wallUs;
+              std::vector<double> cpuUs;
+              std::uint64_t earlyReturns = 0;
+              wallUs.reserve(sampleCount);
+              cpuUs.reserve(sampleCount);
+              std::thread worker([&] {
+                  for (int i = 0; i < warmupCount; ++i) {
+                      PreciseSleepUs(sleepUs);
+                  }
+                  for (int i = 0; i < sampleCount; ++i) {
+                      const std::uint64_t wall0 = ReadNanos(CLOCK_MONOTONIC_RAW);
+                      const std::uint64_t cpu0 = ReadNanos(CLOCK_THREAD_CPUTIME_ID);
+                      PreciseSleepUs(sleepUs);
+                      const std::uint64_t cpu1 = ReadNanos(CLOCK_THREAD_CPUTIME_ID);
+                      const std::uint64_t wall1 = ReadNanos(CLOCK_MONOTONIC_RAW);
+                      if (wall1 < wall0 || cpu1 < cpu0) {
+                          std::abort();
+                      }
+                      if (wall1 - wall0 < sleepUs * 1000ULL) {
+                          ++earlyReturns;
+                      }
+                      wallUs.push_back(static_cast<double>(wall1 - wall0) / 1000.0);
+                      cpuUs.push_back(static_cast<double>(cpu1 - cpu0) / 1000.0);
+                  }
+              });
+              worker.join();
+              std::sort(wallUs.begin(), wallUs.end());
+              std::sort(cpuUs.begin(), cpuUs.end());
+              const double wallMean = std::accumulate(wallUs.begin(), wallUs.end(), 0.0) / sampleCount;
+              const double cpuMean = std::accumulate(cpuUs.begin(), cpuUs.end(), 0.0) / sampleCount;
+              std::cout << variant << ',' << round << ',' << sleepUs << ','
+                        << std::fixed << std::setprecision(3)
+                        << wallUs[sampleCount / 2] << ',' << wallUs[sampleCount * 90 / 100] << ','
+                        << wallUs[sampleCount * 99 / 100] << ',' << wallMean << ','
+                        << cpuUs[sampleCount / 2] << ',' << cpuUs[sampleCount * 90 / 100] << ','
+                        << cpuUs[sampleCount * 99 / 100] << ',' << cpuMean << ',' << earlyReturns << '\n';
+          }
+
+          int main(int argc, char** argv) {
+              const std::string variant = argc > 1 ? argv[1] : "unknown";
+              const std::string round = argc > 2 ? argv[2] : "0";
+              constexpr unsigned long long waitValues[] = {10ULL, 30ULL, 50ULL};
+              for (const unsigned long long sleepUs : waitValues) {
+                  Run(variant, round, sleepUs);
+              }
               return 0;
+          }
+          EOF
+
+          cat << 'EOF' > tools/disasm_short_wait.cpp
+          #include "prx/libc/include/PreciseWait.hpp"
+
+          extern "C" {
+          void export_PreciseSleepUs_10() { PreciseSleepUs(10); }
+          void export_PreciseSleepUs_30() { PreciseSleepUs(30); }
+          void export_PreciseSleepUs_50() { PreciseSleepUs(50); }
+          void export_PreciseSleepUs_dynamic(unsigned long long micros) { PreciseSleepUs(micros); }
           }
           EOF
 
@@ -158,9 +228,28 @@ jobs:
           clang++ --version >> "$META_FILE" 2>&1 || true
 
       - name: Level 1 - Build and Disassemble Standalone Harness (x86_64)
+        env:
+          BASELINE_SHA_INPUT: ${{ inputs.baseline_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           PROD_DIR="output/level1_harness/production"
+          BASE_DIR="output/level1_harness/baseline"
           DIAG_DIR="output/level1_harness/diagnostic"
+          BENCH_DIR="output/short_wait_ab"
+          mkdir -p "$BASE_DIR"
+          mkdir -p "$BENCH_DIR"
+
+          BASELINE_SHA="$BASELINE_SHA_INPUT"
+          if [ -z "$BASELINE_SHA" ]; then
+            BASELINE_SHA="$PUSH_BEFORE"
+          fi
+          if [ -z "$BASELINE_SHA" ] || [ "$BASELINE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            BASELINE_SHA="$(git rev-parse HEAD^)"
+          fi
+          git cat-file -e "$BASELINE_SHA:core/libs/prx/libc/include/PreciseWait.hpp"
+          echo "$BASELINE_SHA" > "$BENCH_DIR/baseline_sha.txt"
+          mkdir -p "$BASE_DIR/include/prx/libc/include"
+          git show "$BASELINE_SHA:core/libs/prx/libc/include/PreciseWait.hpp" > "$BASE_DIR/include/prx/libc/include/PreciseWait.hpp"
 
           echo "=== Compiling Level 1 Pure Production PreciseWait (x86_64) ==="
           clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -Icore/libs tools/disasm_precise_wait.cpp -c -o "$PROD_DIR/precise_wait.o"
@@ -169,7 +258,27 @@ jobs:
           xcrun otool -tvV "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.x86_64.otool.txt"
           nm -nm "$PROD_DIR/precise_wait.o" > "$PROD_DIR/precise_wait.symbols.txt"
 
-          echo "=== Compiling Level 1 Pure Production bench_macos (x86_64) ==="
+          echo "=== Compiling Baseline Production PreciseWait (x86_64) ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -I"$BASE_DIR/include" tools/disasm_short_wait.cpp -c -o "$BASE_DIR/short_wait_probe.o"
+          xcrun llvm-objdump --macho --disassemble --demangle "$BASE_DIR/short_wait_probe.o" > "$BASE_DIR/short_wait_probe.x86_64.asm.txt"
+
+          echo "=== Compiling Baseline and Candidate Short-Wait Benchmarks (x86_64) ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -I"$BASE_DIR/include" tools/bench_production.cpp -o "$BENCH_DIR/bench_baseline"
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -Icore/libs tools/bench_production.cpp -o "$BENCH_DIR/bench_candidate"
+          echo "variant,round,target_us,wall_p50_us,wall_p90_us,wall_p99_us,wall_mean_us,cpu_p50_us,cpu_p90_us,cpu_p99_us,cpu_mean_us,early_returns" > "$BENCH_DIR/results.csv"
+          for round in 1 2 3 4 5; do
+            if [ $((round % 2)) -eq 1 ]; then
+              "$BENCH_DIR/bench_baseline" baseline "$round" >> "$BENCH_DIR/results.csv"
+              "$BENCH_DIR/bench_candidate" candidate "$round" >> "$BENCH_DIR/results.csv"
+            else
+              "$BENCH_DIR/bench_candidate" candidate "$round" >> "$BENCH_DIR/results.csv"
+              "$BENCH_DIR/bench_baseline" baseline "$round" >> "$BENCH_DIR/results.csv"
+            fi
+          done
+
+          echo "=== Compiling Candidate Pure Production bench_macos (x86_64) ==="
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -Icore/libs tools/disasm_short_wait.cpp -c -o "$PROD_DIR/short_wait_probe.o"
+          xcrun llvm-objdump --macho --disassemble --demangle "$PROD_DIR/short_wait_probe.o" > "$PROD_DIR/short_wait_probe.x86_64.asm.txt"
           clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -Icore/libs tools/bench_production.cpp -o "$PROD_DIR/bench_macos"
           xcrun llvm-objdump --macho --disassemble --demangle "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.x86_64.asm.txt"
           nm -nm "$PROD_DIR/bench_macos" > "$PROD_DIR/bench_macos.symbols.txt"
@@ -186,36 +295,33 @@ jobs:
             -DBUILD_TESTING=OFF \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_CXX_FLAGS="-Rpass=inline -Rpass-missed=inline -fsave-optimization-record" \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
           cp build-macos/compile_commands.json output/metadata/compile_commands.json
 
-          echo "=== Building Production Libraries and Call Sites with Ninja ==="
-          cmake --build build-macos --target libs -- -k 0 || true
-
-          echo "=== Explicitly Building Specific Call Site Objects ==="
+          echo "=== Building Selected Production Call-Site Objects with Clang Inline Remarks ==="
           cmake --build build-macos --target \
             core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
             core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
-            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Socket.cpp.o \
-            core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Socket/src/Udp.cpp.o \
             core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
-            core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
-            -- -k 0 || true
+            2>&1 | tee output/metadata/inline_remarks.txt
 
       - name: Level 2 - Analyze Production Call Site Objects (.o)
         run: |
           OBJ_DIR="output/level2_cmake_objects"
           CALL_DIR="output/call_sites"
 
-          echo "=== Collecting and Disassembling Call Site Objects ==="
-          find build-macos/core/libs/prx -name "*.o" 2>/dev/null | while read -r obj; do
+          echo "=== Collecting and Disassembling Selected Call-Site Objects ==="
+          for obj in \
+            build-macos/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
+            build-macos/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
+            build-macos/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o; do
+            test -f "$obj"
             base=$(basename "$obj")
-            dir=$(basename $(dirname $(dirname "$obj")))
-            target_name="${dir}_${base}"
-            cp "$obj" "$OBJ_DIR/${target_name}"
-            xcrun llvm-objdump --macho --disassemble --demangle "$obj" > "$CALL_DIR/${target_name}.asm.txt" 2>&1 || true
-            nm -nm "$obj" > "$CALL_DIR/${target_name}.symbols.txt" 2>&1 || true
+            cp "$obj" "$OBJ_DIR/$base"
+            xcrun llvm-objdump --macho --disassemble --demangle "$obj" > "$CALL_DIR/${base}.asm.txt"
+            nm -nm "$obj" > "$CALL_DIR/${base}.symbols.txt"
           done
 
       - name: Level 3 - Disassemble and Analyze Built Production .prx
@@ -248,18 +354,16 @@ jobs:
           cmake --build build-macos-diag --target \
             core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
             core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
-            core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o \
-            core/libs/prx/libSceVideoOut/CMakeFiles/libSceVideoOut.dir/src/VideoOutDriver.cpp.o \
-            -- -k 0 || true
+            core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o
 
           DIAG_DIR="output/level3_diagnostic_prx"
-          find build-macos-diag/core/libs/libs -name "*.prx" 2>/dev/null | while read -r prx; do
-            name=$(basename "$prx")
-            xcrun llvm-objdump --macho --disassemble --demangle --source "$prx" > "$DIAG_DIR/${name}.source_asm.txt" 2>&1 || true
-          done
-          find build-macos-diag/core/libs/prx -name "*.o" 2>/dev/null | while read -r obj; do
+          for obj in \
+            build-macos-diag/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Apr/src/Apr.cpp.o \
+            build-macos-diag/core/libs/prx/libkernel/CMakeFiles/libkernel.dir/Aio/src/Aio.cpp.o \
+            build-macos-diag/core/libs/prx/libSceFont/CMakeFiles/libSceFont.dir/src/State.cpp.o; do
+            test -f "$obj"
             name=$(basename "$obj")
-            xcrun llvm-objdump --macho --disassemble --demangle --source "$obj" > "$DIAG_DIR/${name}.source_asm.txt" 2>&1 || true
+            xcrun llvm-objdump --macho --disassemble --demangle --source "$obj" > "$DIAG_DIR/${name}.source_asm.txt"
           done
 
       - name: Verify Production Artifacts and Call Sites
@@ -275,21 +379,39 @@ jobs:
           if ls output/level3_production_prx/*.prx 1> /dev/null 2>&1; then
             file output/level3_production_prx/*.prx >> "$REPORT_FILE" 2>&1
           else
-            echo "Note: Full .prx linking requires Linux ELF runtime headers; compiled objects analyzed below." >> "$REPORT_FILE"
+          echo "Note: This macOS workflow analyzes selected production call-site objects; it does not produce the Linux/Windows PRX runtime libraries." >> "$REPORT_FILE"
           fi
           echo "" >> "$REPORT_FILE"
 
           echo "--- 2. Built Production Call Site Objects (.o) ---" >> "$REPORT_FILE"
-          ls -lh output/level2_cmake_objects >> "$REPORT_FILE" 2>&1 || true
+          ls -lh output/level2_cmake_objects >> "$REPORT_FILE"
           echo "" >> "$REPORT_FILE"
 
-          echo "--- 3. PreciseSleep Inlining in Production Call Sites ---" >> "$REPORT_FILE"
-          grep -rn "PreciseSleep" output/call_sites/*.symbols.txt >> "$REPORT_FILE" 2>&1 || echo "Verified: PreciseSleep functions are inlined into call sites." >> "$REPORT_FILE"
+          echo "--- 3. Direct PreciseSleep Calls in Production Disassembly ---" >> "$REPORT_FILE"
+          for asm_file in output/call_sites/*.asm.txt; do
+            echo "$(basename "$asm_file"):" >> "$REPORT_FILE"
+            if grep -nE 'callq.*(PreciseSleep|__Z[0-9]+PreciseSleep)' "$asm_file" >> "$REPORT_FILE"; then
+              true
+            else
+              echo "No direct PreciseSleep call matched in this disassembly; inspect the complete function body and inline remarks." >> "$REPORT_FILE"
+            fi
+          done
+          if grep -nE 'PreciseSleep.*(not inlined|inlined into)' output/metadata/inline_remarks.txt >> "$REPORT_FILE"; then
+            true
+          else
+            echo "No PreciseSleep-specific inline remark was emitted; no inline conclusion is inferred from symbol absence." >> "$REPORT_FILE"
+          fi
           echo "" >> "$REPORT_FILE"
 
-          echo "--- 4. Nanosleep and Clock Syscalls in Call Sites ---" >> "$REPORT_FILE"
-          grep -rn "nanosleep" output/call_sites/*.symbols.txt >> "$REPORT_FILE" 2>&1 || true
-          grep -rn "clock_gettime" output/call_sites/*.symbols.txt >> "$REPORT_FILE" 2>&1 || true
+          echo "--- 4. Sleep and Clock References in Production Disassembly ---" >> "$REPORT_FILE"
+          grep -rnE 'nanosleep|clock_gettime|PreciseSleep' output/call_sites/*.asm.txt output/call_sites/*.symbols.txt >> "$REPORT_FILE" || true
+          echo "" >> "$REPORT_FILE"
+          echo "--- 5. Baseline vs Candidate Short-Wait Benchmark ---" >> "$REPORT_FILE"
+          echo "Baseline commit: $(cat output/short_wait_ab/baseline_sha.txt)" >> "$REPORT_FILE"
+          cat output/short_wait_ab/results.csv >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo "--- 6. Baseline vs Candidate Constant and Dynamic Call-Site Disassembly ---" >> "$REPORT_FILE"
+          grep -nE 'export_PreciseSleepUs_(10|30|50|dynamic)|PreciseSleepFromNanosWithSlack|_clock_gettime|_nanosleep' output/level1_harness/baseline/short_wait_probe.x86_64.asm.txt output/level1_harness/production/short_wait_probe.x86_64.asm.txt >> "$REPORT_FILE" || true
 
           cat "$REPORT_FILE" >> "$GITHUB_STEP_SUMMARY"
 
