@@ -133,6 +133,8 @@ int main() {
     static_assert(PreciseComputeMachDeadline64(1500000ULL, 125, 3, 1000000ULL).status == 0);
     static_assert(PreciseComputeMachDeadline64(1500000ULL, 125, 3, 1000000ULL).sleepTicks == 36000ULL);
     static_assert(PreciseComputeMachDeadline64(1500000ULL, 125, 3, 1000000ULL).wakeDeadline == 1036000ULL);
+    static_assert(PreciseComputeMachDeadline64(1001ULL, 125, 3, 1000000ULL).sleepTicks == 25ULL);
+    static_assert(PreciseComputeMachDeadline64(1001ULL, 125, 3, 1000000ULL).wakeDeadline == 1000025ULL);
     static_assert(PreciseComputeMachDeadline64(50000ULL, 1, 1, 200000ULL).status == 0);
     static_assert(PreciseComputeMachDeadline64(50000ULL, 1, 1, 200000ULL).sleepTicks == 50000ULL);
     static_assert(PreciseComputeMachDeadline64(50000ULL, 1, 1, 200000ULL).wakeDeadline == 250000ULL);
@@ -146,6 +148,8 @@ int main() {
     static_assert(PreciseComputeMachDeadline(1500000ULL, 125, 3, 1000000ULL).status == 0);
     static_assert(PreciseComputeMachDeadline(1500000ULL, 125, 3, 1000000ULL).sleepTicks == 36000ULL);
     static_assert(PreciseComputeMachDeadline(1500000ULL, 125, 3, 1000000ULL).wakeDeadline == 1036000ULL);
+    static_assert(PreciseComputeMachDeadline(1001ULL, 125, 3, 1000000ULL).sleepTicks == 25ULL);
+    static_assert(PreciseComputeMachDeadline(1001ULL, 125, 3, 1000000ULL).wakeDeadline == 1000025ULL);
     static_assert(PreciseComputeMachDeadline(50000ULL, 1, 1, 200000ULL).status == 0);
     static_assert(PreciseComputeMachDeadline(50000ULL, 1, 1, 200000ULL).sleepTicks == 50000ULL);
     static_assert(PreciseComputeMachDeadline(50000ULL, 1, 1, 200000ULL).wakeDeadline == 250000ULL);
@@ -206,6 +210,7 @@ int main() {
              std::tuple{1000ULL, 0U, 1U, 0ULL},
              std::tuple{1000ULL, 1U, 0U, 0ULL},
              std::tuple{1500000ULL, 125U, 3U, 1000000ULL},
+             std::tuple{1001ULL, 125U, 3U, 1000000ULL},
              std::tuple{50000ULL, 1U, 1U, 200000ULL},
              std::tuple{UINT64_MAX, 1U, 2U, 0ULL},
              std::tuple{1000ULL, 1U, 1U, UINT64_MAX - 500ULL},
@@ -216,6 +221,19 @@ int main() {
             std::cerr << "PreciseComputeMachDeadline vs PreciseComputeMachDeadline64 mismatch\n";
             return 1;
         }
+    }
+
+    const auto ceilMachDeadline = PreciseComputeMachDeadline(1001ULL, 125U, 3U, 1000000ULL);
+    if (ceilMachDeadline.status != 0 || ceilMachDeadline.sleepTicks != 25ULL ||
+        ceilMachDeadline.wakeDeadline != 1000025ULL) {
+        std::cerr << "PreciseComputeMachDeadline ceiling conversion check failed\n";
+        return 1;
+    }
+    const auto ceilMachDeadline64 = PreciseComputeMachDeadline64(1001ULL, 125U, 3U, 1000000ULL);
+    if (ceilMachDeadline64.status != 0 || ceilMachDeadline64.sleepTicks != 25ULL ||
+        ceilMachDeadline64.wakeDeadline != 1000025ULL) {
+        std::cerr << "PreciseComputeMachDeadline64 ceiling conversion check failed\n";
+        return 1;
     }
 
 #if defined(__SIZEOF_INT128__) && !defined(_WIN32)

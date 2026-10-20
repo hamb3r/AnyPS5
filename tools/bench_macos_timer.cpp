@@ -288,6 +288,58 @@ inline FastPathResults MeasureFastPath(int count) {
     return res;
 }
 
+inline void ConfigureModeThread(ModeAccumulator& acc) {
+    std::string status = "OFF";
+#if defined(__APPLE__)
+    if (acc.config.enable_policy) {
+        const auto& tb = PreciseMachTimebase();
+        if (tb.numer > 0 && tb.denom > 0) {
+            thread_time_constraint_policy_data_t policy;
+            const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
+            const uint64_t compUs = acc.config.policy_computation_us > 0 ? acc.config.policy_computation_us : 500;
+            const uint64_t computationTicks = (compUs * 1000ULL * tb.denom) / tb.numer;
+            if (periodTicks <= UINT32_MAX && computationTicks <= UINT32_MAX) {
+                policy.period = static_cast<uint32_t>(periodTicks);
+                policy.computation = static_cast<uint32_t>(computationTicks);
+                policy.constraint = static_cast<uint32_t>(periodTicks);
+                policy.preemptible = TRUE;
+                const mach_port_t threadPort = mach_thread_self();
+                const kern_return_t kr = thread_policy_set(
+                    threadPort,
+                    THREAD_TIME_CONSTRAINT_POLICY,
+                    reinterpret_cast<thread_policy_t>(&policy),
+                    THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+                mach_port_deallocate(mach_task_self(), threadPort);
+                if (kr == KERN_SUCCESS) {
+                    status = "ON (kr=0)";
+                } else {
+                    status = "FAILED (kr=" + std::to_string(kr) + ")";
+                }
+            } else {
+                status = "OVERFLOW";
+            }
+        } else {
+            status = "TIMEBASE_ERR";
+        }
+    }
+#endif
+    if (acc.config.enable_policy) {
+        if (status != "ON (kr=0)") {
+            acc.policy_failures++;
+        }
+        acc.policy_status = status;
+        acc.spin_tail_us = 200;
+    } else {
+        acc.policy_status = "OFF";
+        acc.spin_tail_us = 500;
+    }
+
+    g_preciseWaitTraceBackend = acc.config.backend;
+    g_preciseWaitTraceAllowLowSlack = acc.config.enable_policy;
+    g_preciseWaitTraceSpinLoop = acc.config.spin_loop;
+    g_preciseWaitTracePolicyComputationUs = acc.config.policy_computation_us;
+}
+
 inline void RunModeSlice(
     ModeAccumulator& acc,
     unsigned long long sleep_micros,
@@ -298,56 +350,9 @@ inline void RunModeSlice(
     double probe_spin_c_p50) {
 
     std::thread worker([&] {
-        std::string status = "OFF";
-#if defined(__APPLE__)
-        if (acc.config.enable_policy) {
-            const auto& tb = PreciseMachTimebase();
-            if (tb.numer > 0 && tb.denom > 0) {
-                thread_time_constraint_policy_data_t policy;
-                const uint64_t periodTicks = (1000000ULL * tb.denom) / tb.numer;
-                const uint64_t compUs = acc.config.policy_computation_us > 0 ? acc.config.policy_computation_us : 500;
-                const uint64_t computationTicks = (compUs * 1000ULL * tb.denom) / tb.numer;
-                if (periodTicks <= UINT32_MAX && computationTicks <= UINT32_MAX) {
-                    policy.period = static_cast<uint32_t>(periodTicks);
-                    policy.computation = static_cast<uint32_t>(computationTicks);
-                    policy.constraint = static_cast<uint32_t>(periodTicks);
-                    policy.preemptible = TRUE;
-                    const mach_port_t threadPort = mach_thread_self();
-                    const kern_return_t kr = thread_policy_set(
-                        threadPort,
-                        THREAD_TIME_CONSTRAINT_POLICY,
-                        reinterpret_cast<thread_policy_t>(&policy),
-                        THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-                    mach_port_deallocate(mach_task_self(), threadPort);
-                    if (kr == KERN_SUCCESS) {
-                        status = "ON (kr=0)";
-                    } else {
-                        status = "FAILED (kr=" + std::to_string(kr) + ")";
-                    }
-                } else {
-                    status = "OVERFLOW";
-                }
-            } else {
-                status = "TIMEBASE_ERR";
-            }
-        }
-#endif
-        if (acc.config.enable_policy) {
-            if (status != "ON (kr=0)") {
-                acc.policy_failures++;
-            }
-            acc.policy_status = status;
-            acc.spin_tail_us = 200;
-        } else {
-            acc.policy_status = "OFF";
-            acc.spin_tail_us = 500;
-        }
-
-        g_preciseWaitTraceBackend = acc.config.backend;
-        g_preciseWaitTraceAllowLowSlack = acc.config.enable_policy;
-        g_preciseWaitTraceSpinLoop = acc.config.spin_loop;
-        g_preciseWaitTracePolicyComputationUs = acc.config.policy_computation_us;
+        ConfigureModeThread(acc);
         g_preciseWaitTraceActive = true;
+        g_preciseWaitExperimentActive = false;
 
         for (int i = 0; i < warmup_count; ++i) {
             PreciseSleepUs(sleep_micros);
@@ -444,6 +449,69 @@ inline void RunModeSlice(
         }
 
         g_preciseWaitTraceActive = false;
+        g_preciseWaitExperimentActive = false;
+    });
+
+    worker.join();
+}
+
+inline void RunCleanComparisonSlice(
+    ModeAccumulator& acc,
+    unsigned long long sleep_micros,
+    int warmup_count,
+    int sample_count) {
+
+    std::thread worker([&] {
+        ConfigureModeThread(acc);
+        g_preciseWaitTraceActive = false;
+        g_preciseWaitExperimentActive = true;
+
+        for (int i = 0; i < warmup_count; ++i) {
+            PreciseSleepUs(sleep_micros);
+        }
+
+        const std::uint64_t target_nanos = sleep_micros * 1000ULL;
+        std::vector<double> slice_wall;
+        slice_wall.reserve(sample_count);
+
+        for (int i = 0; i < sample_count; ++i) {
+            const std::uint64_t t0 = PreciseMonotonicNanos();
+            const std::uint64_t cpu0 = ReadThreadCpuNanos();
+            PreciseSleepUs(sleep_micros);
+            const std::uint64_t t1 = PreciseMonotonicNanos();
+            const std::uint64_t cpu1 = ReadThreadCpuNanos();
+            if (t1 < t0 || cpu1 < cpu0) {
+                acc.invalid_samples++;
+                continue;
+            }
+
+            const std::uint64_t elapsed_nanos = t1 - t0;
+            const std::uint64_t cpu_nanos = cpu1 - cpu0;
+            const double wall_us = static_cast<double>(elapsed_nanos) / 1000.0;
+            const double cpu_us = static_cast<double>(cpu_nanos) / 1000.0;
+            const double overshoot_us = (static_cast<double>(elapsed_nanos) - static_cast<double>(target_nanos)) / 1000.0;
+
+            acc.total_samples++;
+            acc.v_total_wall.push_back(wall_us);
+            acc.v_total_overshoot.push_back(overshoot_us);
+            acc.v_total_cpu.push_back(cpu_us);
+            slice_wall.push_back(wall_us);
+            if (elapsed_nanos < target_nanos) {
+                acc.early_returns++;
+            }
+            if (elapsed_nanos > 1650000ULL) {
+                acc.outliers_count++;
+            }
+            if (g_preciseWaitExperimentError != 0) {
+                acc.syscall_errors++;
+            }
+        }
+
+        if (!slice_wall.empty()) {
+            acc.round_p50_wall.push_back(ComputeStats(slice_wall).p50);
+        }
+
+        g_preciseWaitExperimentActive = false;
     });
 
     worker.join();
@@ -753,33 +821,89 @@ int main() {
            << "n/a |\n\n";
 #endif
 
-    report << "#### 3. Raw Measurements: 2x2 Matrix for PreciseSleepUs(1500) (10 Interleaved Rounds, 5000 Samples per Mode)\n\n";
+    report << "#### 3. Clean End-to-End Comparison for PreciseSleepUs(1500) (No Internal Phase Probes)\n\n";
 
     std::vector<ModeAccumulator> modes;
-    modes.push_back(ModeAccumulator{{PreciseWaitBackend::Nanosleep, false, "nanosleep"}});
-    modes.push_back(ModeAccumulator{{PreciseWaitBackend::Nanosleep, true,  "nanosleep"}});
+    modes.push_back(ModeAccumulator{{PreciseWaitBackend::Nanosleep, false, "nanosleep_remaining"}});
+    modes.push_back(ModeAccumulator{{PreciseWaitBackend::NanosleepNoRemaining, false, "nanosleep_null"}});
 #if defined(__APPLE__)
     modes.push_back(ModeAccumulator{{PreciseWaitBackend::MachWaitUntil, false, "mach_wait_until"}});
-    modes.push_back(ModeAccumulator{{PreciseWaitBackend::MachWaitUntil, true,  "mach_wait_until"}});
+#endif
+    modes.push_back(ModeAccumulator{{PreciseWaitBackend::Nanosleep, true, "nanosleep_remaining"}});
+    modes.push_back(ModeAccumulator{{PreciseWaitBackend::NanosleepNoRemaining, true, "nanosleep_null"}});
+#if defined(__APPLE__)
+    modes.push_back(ModeAccumulator{{PreciseWaitBackend::MachWaitUntil, true, "mach_wait_until"}});
 #endif
 
     const size_t num_modes = modes.size();
     const int kRounds = 10;
     const int kWarmupPerRound = 10;
     const int kSamplesPerRound = 500;
+    const int kCleanSamplesPerRound = 100;
 
     const std::vector<std::vector<int>> round_permutations = {
-        {0, 1, 2, 3},
-        {3, 2, 1, 0},
-        {1, 3, 0, 2},
-        {2, 0, 3, 1},
-        {0, 2, 3, 1},
-        {3, 1, 0, 2},
-        {2, 3, 1, 0},
-        {1, 0, 2, 3},
-        {0, 3, 1, 2},
-        {2, 1, 0, 3}
+        {0, 1, 2, 3, 4, 5},
+        {5, 4, 3, 2, 1, 0},
+        {1, 3, 5, 0, 2, 4},
+        {4, 2, 0, 5, 3, 1},
+        {0, 2, 4, 1, 3, 5},
+        {5, 3, 1, 4, 2, 0},
+        {2, 5, 1, 4, 0, 3},
+        {3, 0, 4, 1, 5, 2},
+        {1, 4, 2, 5, 0, 3},
+        {3, 5, 2, 0, 4, 1}
     };
+
+    std::vector<ModeAccumulator> clean_modes;
+    clean_modes.reserve(modes.size());
+    for (const auto& mode : modes) {
+        clean_modes.push_back(ModeAccumulator{mode.config});
+    }
+
+    for (int r = 0; r < kRounds; ++r) {
+        const auto& perm = round_permutations[r % round_permutations.size()];
+        for (int idx : perm) {
+            if (static_cast<size_t>(idx) < clean_modes.size()) {
+                RunCleanComparisonSlice(clean_modes[idx], 1500, kWarmupPerRound, kCleanSamplesPerRound);
+            }
+        }
+    }
+
+    for (auto& m : clean_modes) {
+        FinalizeStats(m);
+    }
+
+    report << "10 interleaved rounds, 100 measured samples per mode per round, each slice on a fresh worker thread. Wall and thread CPU are measured outside the wait call; no T0..T4 trace probes run inside the wait implementation.\n\n";
+    report << "| Backend | Policy | Spin Tail | Wall p50 | Wall p90 | Wall p99 | Wall Max | Overshoot p50 | Thread CPU p50 | Outliers (>1650µs) | Early | Backend Errors | Policy Failures | Invalid |\n";
+    report << "|---|:---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|:---:|:---:|\n";
+    for (const auto& m : clean_modes) {
+        report << "| `" << m.config.backend_name << "` | "
+               << (m.config.enable_policy ? "**ON**" : "OFF") << " | "
+               << m.spin_tail_us << " µs | "
+               << std::fixed << std::setprecision(1)
+               << m.s_total_wall.p50 << " µs | "
+               << m.s_total_wall.p90 << " µs | "
+               << m.s_total_wall.p99 << " µs | "
+               << m.s_total_wall.max_val << " µs | "
+               << (m.s_total_overshoot.p50 >= 0 ? "+" : "") << m.s_total_overshoot.p50 << " µs | "
+               << m.s_total_cpu.p50 << " µs | "
+               << m.outliers_count << " / " << m.total_samples << " | "
+               << m.early_returns << " | "
+               << m.syscall_errors << " | "
+               << m.policy_failures << " | "
+               << m.invalid_samples << " |\n";
+    }
+    report << "\n##### 3.1 Clean End-to-End Per-Round Wall p50 (100 Samples/Round)\n\n";
+    report << "| Backend | Policy | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 | Overall p50 |\n";
+    report << "|---|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (const auto& m : clean_modes) {
+        report << "| `" << m.config.backend_name << "` | " << (m.config.enable_policy ? "**ON**" : "OFF") << " | ";
+        for (double r_p50 : m.round_p50_wall) {
+            report << std::fixed << std::setprecision(1) << r_p50 << " µs | ";
+        }
+        report << m.s_total_wall.p50 << " µs |\n";
+    }
+    report << "\n#### 4. Instrumented Phase Trace Matrix (T0..T4, 10 Interleaved Rounds, 5000 Samples per Mode)\n\n";
 
     for (int r = 0; r < kRounds; ++r) {
         const auto& perm = round_permutations[r % round_permutations.size()];
@@ -821,7 +945,7 @@ int main() {
     }
     report << "\n";
 
-    report << "##### 3.1 Per-Round Wall p50 Breakdown (10 Rounds, 500 Samples/Round, Interleaved)\n\n";
+    report << "##### 4.1 Instrumented Per-Round Wall p50 Breakdown (10 Rounds, 500 Samples/Round, Interleaved)\n\n";
     report << "| Backend | Policy | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 | Overall p50 |\n";
     report << "|---|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
     for (const auto& m : modes) {
@@ -833,7 +957,7 @@ int main() {
     }
     report << "\n";
 
-    report << "#### 4. Calibrated Measurements (Probe Baseline Subtracted, Unclamped)\n\n";
+    report << "#### 5. Calibrated Instrumented Measurements (Probe Baseline Subtracted, Unclamped)\n\n";
     report << "| Backend | Policy | Calibrated Overshoot p50 | Calibrated Wall p50 | Calibrated Wall p90 | Calibrated Wall p99 | Calibrated Spin CPU p50 | Calibrated Total CPU p50 |\n";
     report << "|---|:---:|---:|---:|---:|---:|---:|---:|\n";
 
@@ -850,7 +974,7 @@ int main() {
     }
     report << "\n";
 
-    report << "#### 5. Detailed Phase Deconstruction (Raw)\n\n";
+    report << "#### 6. Detailed Phase Deconstruction (Raw)\n\n";
     for (const auto& m : modes) {
         report << "##### Mode: `" << m.config.backend_name << "` with Policy " << (m.config.enable_policy ? "ON" : "OFF")
                << " (Residual Wall p50=" << std::setprecision(3) << m.s_wall_residual.p50 * 1000.0 << " ns, "
@@ -896,9 +1020,9 @@ int main() {
     }
 
 #if defined(__APPLE__)
-    report << "#### 6. Clock Source Comparison (Probe Latency & Spin Loop)\n\n";
+    report << "#### 7. Clock Source Comparison (Probe Latency & Spin Loop)\n\n";
 
-    report << "##### 6.1a Direct Single Read Latency Distribution (10k individual unrolled invocations)\n\n";
+    report << "##### 7.1a Direct Single Read Latency Distribution (10k individual unrolled invocations)\n\n";
     report << "| Clock Source | Min Latency | p50 Latency | p90 Latency | p99 Latency | Mean Latency | Max Latency |\n";
     report << "|---|---:|---:|---:|---:|---:|---:|\n";
 
@@ -920,7 +1044,7 @@ int main() {
            << s_np.p90_ns << " ns | " << s_np.p99_ns << " ns | "
            << s_np.mean_ns << " ns | " << s_np.max_ns << " ns |\n\n";
 
-    report << "##### 6.1b Amortized Per-Read Latency (Throughput: 100k samples, 1000 chunks x 100 reads)\n\n";
+    report << "##### 7.1b Amortized Per-Read Latency (Throughput: 100k samples, 1000 chunks x 100 reads)\n\n";
     report << "| Clock Source | Min Latency | p50 Latency | p90 Latency | p99 Latency | Mean Latency | Max Latency |\n";
     report << "|---|---:|---:|---:|---:|---:|---:|\n";
 
@@ -942,7 +1066,7 @@ int main() {
            << p_np.p90_ns << " ns | " << p_np.p99_ns << " ns | "
            << p_np.mean_ns << " ns | " << p_np.max_ns << " ns |\n\n";
 
-    report << "##### 6.2 Spin Loop Comparison (Policy ON, Fresh Threads, Interleaved Rounds)\n\n";
+    report << "##### 7.2 Spin Loop Comparison (Policy ON, Fresh Threads, Interleaved Rounds)\n\n";
     report << "| Target Duration | Clock Source | Wall p50 | Wall p90 | Wall p99 | Overshoot p50 | CPU Time p50 | Spin Unaccounted p50 | Early Returns |\n";
     report << "|---|---|---:|---:|---:|---:|---:|---:|---:|\n";
 
@@ -997,7 +1121,7 @@ int main() {
         }
     }
 
-    report << "#### 7. Spin Loop Strategy Comparison: `clock_gettime` vs `mach_absolute_time` (Policy ON, 200 µs tail, PreciseSleepUs(1500), 5000 Samples per Mode)\n\n";
+    report << "#### 8. Spin Loop Strategy Comparison: `clock_gettime` vs `mach_absolute_time` (Policy ON, 200 µs tail, PreciseSleepUs(1500), 5000 Samples per Mode)\n\n";
     report << "| Backend | Policy Status | Spin Strategy | Wall p50 | Wall p90 | Wall p99 | Wall Max | Overshoot p50 | Total CPU p50 | Spin CPU p50 | Spin Wall p50 | Outliers (>1650µs) | Early |\n";
     report << "|---|:---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n";
 
@@ -1059,7 +1183,7 @@ int main() {
     }
     report << "\n";
 
-    report << "##### 7.1 Per-Round Wall p50 Breakdown (10 Rounds, 500 Samples/Round, Interleaved)\n\n";
+    report << "##### 8.1 Per-Round Wall p50 Breakdown (10 Rounds, 500 Samples/Round, Interleaved)\n\n";
     report << "| Backend | Strategy | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 | Overall p50 |\n";
     report << "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
     for (const auto& sm : spin_strategy_modes) {
@@ -1089,7 +1213,7 @@ int main() {
         }
     }
 
-    report << "#### 8. Policy Computation Budget Sweep: 250 µs vs 350 µs vs 500 µs (Fixed 200 µs Spin Tail, PreciseSleepUs(1500), 5000 Samples per Mode)\n\n";
+    report << "#### 9. Policy Computation Budget Sweep: 250 µs vs 350 µs vs 500 µs (Fixed 200 µs Spin Tail, PreciseSleepUs(1500), 5000 Samples per Mode)\n\n";
     report << "| Backend | Budget | Policy Status | Wall p50 | Wall p90 | Wall p99 | Wall Max | Total CPU p50 | Spin CPU p50 | Spin CPU p90 | Spin CPU p99 | Syscall Wall p50 | Syscall Wall p90 | Syscall Wall p99 | Syscall Overshoot p50 | Syscall Overshoot p90 | Syscall Overshoot p99 | Outliers (>1650µs) | Early |\n";
     report << "|---|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n";
 
@@ -1156,7 +1280,7 @@ int main() {
     }
     report << "\n";
 
-    report << "##### 8.1 Per-Round Wall p50 Breakdown (10 Rounds, 500 Samples/Round, Interleaved)\n\n";
+    report << "##### 9.1 Per-Round Wall p50 Breakdown (10 Rounds, 500 Samples/Round, Interleaved)\n\n";
     report << "| Backend | Budget | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 | Overall p50 |\n";
     report << "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
     for (const auto& bm : budget_modes) {

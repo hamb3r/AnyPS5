@@ -150,7 +150,8 @@ inline constexpr PreciseMachDeadlineResult PreciseComputeMachDeadline64(
         return result;
     }
     const std::uint64_t baseTicks = q * denom;
-    const std::uint64_t remTicks = (r * static_cast<std::uint64_t>(denom)) / numer;
+    const std::uint64_t remProduct = r * static_cast<std::uint64_t>(denom);
+    const std::uint64_t remTicks = (remProduct / numer) + ((remProduct % numer) != 0 ? 1ULL : 0ULL);
     if (remTicks > UINT64_MAX - baseTicks) [[unlikely]] {
         result.status = 0xFFFFFFFE;
         return result;
@@ -175,8 +176,8 @@ inline constexpr PreciseMachDeadlineResult PreciseComputeMachDeadline(
         result.status = 0xFFFFFFFF;
         return result;
     }
-    const unsigned __int128 sleepTicks128 =
-        (static_cast<unsigned __int128>(sleepNanos) * denom) / numer;
+    const unsigned __int128 product = static_cast<unsigned __int128>(sleepNanos) * denom;
+    const unsigned __int128 sleepTicks128 = (product / numer) + ((product % numer) != 0 ? 1U : 0U);
     if (sleepTicks128 > UINT64_MAX) [[unlikely]] {
         result.status = 0xFFFFFFFE;
         return result;
@@ -395,6 +396,7 @@ inline std::uint64_t PreciseMonotonicNanos() {
 #ifdef APS5_PRECISE_WAIT_TRACE
 enum class PreciseWaitBackend {
     Nanosleep,
+    NanosleepNoRemaining,
     MachWaitUntil
 };
 
@@ -425,6 +427,8 @@ inline thread_local bool g_preciseWaitTraceActive = false;
 inline thread_local PreciseWaitBackend g_preciseWaitTraceBackend = PreciseWaitBackend::Nanosleep;
 inline thread_local PreciseWaitSpinLoop g_preciseWaitTraceSpinLoop = PreciseWaitSpinLoop::MonotonicNanos;
 inline thread_local bool g_preciseWaitTraceAllowLowSlack = true;
+inline thread_local bool g_preciseWaitExperimentActive = false;
+inline thread_local std::uint32_t g_preciseWaitExperimentError = 0;
 inline thread_local std::uint32_t g_preciseWaitTracePolicyComputationUs = 500;
 
 inline std::uint64_t PreciseThreadCpuNanosInternal() {
@@ -525,7 +529,12 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
         g_preciseWaitTraceSample.cpu0 = PreciseThreadCpuNanosInternal();
         g_preciseWaitTraceSample.eintr_count = 0;
         g_preciseWaitTraceSample.syscall_return_code = 0;
+    }
+    if (g_preciseWaitTraceActive || g_preciseWaitExperimentActive) {
         allowLowSlack = g_preciseWaitTraceAllowLowSlack;
+    }
+    if (g_preciseWaitExperimentActive) {
+        g_preciseWaitExperimentError = 0;
     }
 #endif
     const std::uint64_t deadlineNanos = (nanos > UINT64_MAX - startNanos) ? UINT64_MAX : (startNanos + nanos);
@@ -614,70 +623,139 @@ inline void PreciseSleepFromNanosWithSlack(std::uint64_t startNanos, unsigned lo
 #endif
     if (nanos > spinTailNanos) [[unlikely]] {
         const unsigned long long sleepNanos = nanos - spinTailNanos;
+        const std::uint64_t wakeNanos = deadlineNanos - spinTailNanos;
 #ifdef APS5_PRECISE_WAIT_TRACE
-        if (g_preciseWaitTraceActive && g_preciseWaitTraceBackend == PreciseWaitBackend::MachWaitUntil) {
+        const bool experimentActive = g_preciseWaitExperimentActive || g_preciseWaitTraceActive;
+        const bool useMachWaitUntil = experimentActive && g_preciseWaitTraceBackend == PreciseWaitBackend::MachWaitUntil;
+        const bool useNanosleepNoRemaining =
+            experimentActive && g_preciseWaitTraceBackend == PreciseWaitBackend::NanosleepNoRemaining;
+        bool completedMachWait = false;
+#else
+        constexpr bool useNanosleepNoRemaining = false;
+#endif
+#ifdef APS5_PRECISE_WAIT_TRACE
+        if (useMachWaitUntil) {
             const auto& tb = PreciseMachTimebase();
             if (tb.numer == 0 || tb.denom == 0) [[unlikely]] {
-                g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
-                g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
-                g_preciseWaitTraceSample.t2 = g_preciseWaitTraceSample.t1;
-                g_preciseWaitTraceSample.cpu2 = g_preciseWaitTraceSample.cpu1;
-                g_preciseWaitTraceSample.t3 = g_preciseWaitTraceSample.t1;
-                g_preciseWaitTraceSample.cpu3 = g_preciseWaitTraceSample.cpu1;
-                g_preciseWaitTraceSample.syscall_return_code = 0xFFFFFFFF;
-                return;
+                if (g_preciseWaitTraceActive) {
+                    g_preciseWaitTraceSample.syscall_return_code = 0xFFFFFFFF;
+                }
+                if (g_preciseWaitExperimentActive) {
+                    g_preciseWaitExperimentError = 0xFFFFFFFF;
+                }
+            } else {
+                const std::uint64_t nowNanos = PreciseMonotonicNanos();
+                if (nowNanos < wakeNanos) {
+                    const std::uint64_t nowTicks = mach_absolute_time();
+                    const auto machDeadline = PreciseComputeMachDeadline(
+                        wakeNanos - nowNanos, tb.numer, tb.denom, nowTicks);
+                    if (machDeadline.status == 0) {
+                        if (g_preciseWaitTraceActive) {
+                            g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
+                            g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
+                            g_preciseWaitTraceSample.req_sleep_nanos =
+                                g_preciseWaitTraceSample.t1 < wakeNanos
+                                    ? wakeNanos - g_preciseWaitTraceSample.t1
+                                    : 0;
+                        }
+                        kern_return_t kr = KERN_ABORTED;
+                        for (;;) {
+                            kr = mach_wait_until(machDeadline.wakeDeadline);
+                            if (kr == KERN_SUCCESS) {
+                                break;
+                            }
+                            if (kr != KERN_ABORTED) {
+                                break;
+                            }
+#ifdef APS5_PRECISE_WAIT_TRACE
+                            if (g_preciseWaitTraceActive) {
+                                g_preciseWaitTraceSample.eintr_count++;
+                            }
+#endif
+                            if (PreciseMonotonicNanos() >= wakeNanos) {
+                                kr = KERN_SUCCESS;
+                                break;
+                            }
+                        }
+                        if (g_preciseWaitTraceActive) {
+                            g_preciseWaitTraceSample.t2 = PreciseMonotonicNanos();
+                            g_preciseWaitTraceSample.cpu2 = PreciseThreadCpuNanosInternal();
+                            g_preciseWaitTraceSample.syscall_return_code = static_cast<std::uint32_t>(kr);
+                        }
+                        completedMachWait = kr == KERN_SUCCESS;
+                        if (kr != KERN_SUCCESS && g_preciseWaitExperimentActive) {
+                            g_preciseWaitExperimentError = static_cast<std::uint32_t>(kr);
+                        }
+                    } else if (g_preciseWaitTraceActive) {
+                        g_preciseWaitTraceSample.syscall_return_code = machDeadline.status;
+                    }
+                    if (machDeadline.status != 0 && g_preciseWaitExperimentActive) {
+                        g_preciseWaitExperimentError = machDeadline.status;
+                    }
+                } else {
+                    if (g_preciseWaitTraceActive) {
+                        g_preciseWaitTraceSample.req_sleep_nanos = 0;
+                        g_preciseWaitTraceSample.t1 = nowNanos;
+                        g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
+                        g_preciseWaitTraceSample.t2 = g_preciseWaitTraceSample.t1;
+                        g_preciseWaitTraceSample.cpu2 = g_preciseWaitTraceSample.cpu1;
+                    }
+                    completedMachWait = true;
+                }
             }
-            const std::uint64_t nowTicks = mach_absolute_time();
-            const auto machDeadline =
-                PreciseComputeMachDeadline(sleepNanos, tb.numer, tb.denom, nowTicks);
-            if (machDeadline.status != 0) [[unlikely]] {
-                g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
-                g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
-                g_preciseWaitTraceSample.t2 = g_preciseWaitTraceSample.t1;
-                g_preciseWaitTraceSample.cpu2 = g_preciseWaitTraceSample.cpu1;
-                g_preciseWaitTraceSample.t3 = g_preciseWaitTraceSample.t1;
-                g_preciseWaitTraceSample.cpu3 = g_preciseWaitTraceSample.cpu1;
-                g_preciseWaitTraceSample.syscall_return_code = machDeadline.status;
-                return;
-            }
-            g_preciseWaitTraceSample.req_sleep_nanos = sleepNanos;
-            g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
-            g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
-            const kern_return_t kr = mach_wait_until(machDeadline.wakeDeadline);
-            g_preciseWaitTraceSample.t2 = PreciseMonotonicNanos();
-            g_preciseWaitTraceSample.cpu2 = PreciseThreadCpuNanosInternal();
-            g_preciseWaitTraceSample.syscall_return_code = static_cast<std::uint32_t>(kr);
-        } else {
+        }
+        if (!completedMachWait) {
 #endif
             struct timespec req;
-            req.tv_sec = static_cast<time_t>(sleepNanos / 1000000000ULL);
-            req.tv_nsec = static_cast<long>(sleepNanos % 1000000000ULL);
+            std::uint64_t remainingSleepNanos = sleepNanos;
+#ifdef APS5_PRECISE_WAIT_TRACE
+            if (useMachWaitUntil) {
+                const std::uint64_t nowNanos = PreciseMonotonicNanos();
+                remainingSleepNanos = nowNanos < wakeNanos ? wakeNanos - nowNanos : 0;
+            }
+#endif
+            req.tv_sec = static_cast<time_t>(remainingSleepNanos / 1000000000ULL);
+            req.tv_nsec = static_cast<long>(remainingSleepNanos % 1000000000ULL);
 #ifdef APS5_PRECISE_WAIT_TRACE
             if (g_preciseWaitTraceActive) {
-                g_preciseWaitTraceSample.req_sleep_nanos = sleepNanos;
+                g_preciseWaitTraceSample.req_sleep_nanos = remainingSleepNanos;
                 g_preciseWaitTraceSample.t1 = PreciseMonotonicNanos();
                 g_preciseWaitTraceSample.cpu1 = PreciseThreadCpuNanosInternal();
             }
 #endif
-            for (;;) {
-                const int ret = nanosleep(&req, &req);
-                if (ret == 0) [[likely]] {
-                    break;
-                }
-                if (errno == EINTR) {
+            if (remainingSleepNanos > 0) {
+                for (;;) {
+                    const int ret = nanosleep(&req, useNanosleepNoRemaining ? nullptr : &req);
+                    if (ret == 0) [[likely]] {
+                        break;
+                    }
+                    if (errno == EINTR) {
+#ifdef APS5_PRECISE_WAIT_TRACE
+                        if (g_preciseWaitTraceActive) {
+                            g_preciseWaitTraceSample.eintr_count++;
+                        }
+#endif
+                        if (useNanosleepNoRemaining) {
+                            const std::uint64_t nowNanos = PreciseMonotonicNanos();
+                            if (nowNanos >= wakeNanos) {
+                                break;
+                            }
+                            remainingSleepNanos = wakeNanos - nowNanos;
+                            req.tv_sec = static_cast<time_t>(remainingSleepNanos / 1000000000ULL);
+                            req.tv_nsec = static_cast<long>(remainingSleepNanos % 1000000000ULL);
+                        }
+                        continue;
+                    }
 #ifdef APS5_PRECISE_WAIT_TRACE
                     if (g_preciseWaitTraceActive) {
-                        g_preciseWaitTraceSample.eintr_count++;
+                        g_preciseWaitTraceSample.syscall_return_code = static_cast<std::uint32_t>(errno != 0 ? errno : -1);
+                    }
+                    if (g_preciseWaitExperimentActive) {
+                        g_preciseWaitExperimentError = static_cast<std::uint32_t>(errno != 0 ? errno : EINVAL);
                     }
 #endif
-                    continue;
+                    break;
                 }
-#ifdef APS5_PRECISE_WAIT_TRACE
-                if (g_preciseWaitTraceActive) {
-                    g_preciseWaitTraceSample.syscall_return_code = static_cast<std::uint32_t>(errno != 0 ? errno : -1);
-                }
-#endif
-                break;
             }
 #ifdef APS5_PRECISE_WAIT_TRACE
             if (g_preciseWaitTraceActive) {
