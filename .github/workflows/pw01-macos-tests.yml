@@ -1,0 +1,42 @@
+name: PW-01 macOS PreciseWait tests
+
+on:
+  push:
+    branches: [exp/pw01-macos-tests]
+
+permissions:
+  contents: read
+
+jobs:
+  precise-wait:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            name: Intel Mac (native x86_64)
+            rosetta: false
+          - os: macos-latest
+            name: Apple Silicon (Rosetta 2 x86_64)
+            rosetta: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 8535abf58016796e4e917a43dc3d12f3d585b709
+          persist-credentials: false
+      - name: Install Rosetta 2
+        if: matrix.rosetta
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Build and run PreciseWait tests
+        env:
+          APS5_SKIP_TIMING_TESTS: '1'
+        run: |
+          git rev-parse HEAD
+          sw_vers
+          uname -m
+          clang++ --version
+          clang++ -std=c++20 -O3 -DNDEBUG -arch x86_64 -Icore/libs core/libs/tests/PreciseWait.cpp -o precise_wait_tests
+          arch -x86_64 ./precise_wait_tests
