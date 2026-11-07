@@ -3,6 +3,7 @@ name: PW-01 macOS PreciseWait tests
 on:
   push:
     branches: [exp/pw01-macos-tests]
+  workflow_dispatch:
 
 permissions:
   contents: read
